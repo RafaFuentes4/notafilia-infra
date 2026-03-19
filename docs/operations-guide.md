@@ -24,29 +24,87 @@ Practical recipes for common tasks on the cluster. Assumes you have `kubectl` co
 
 ---
 
-## 1. Daily Development Workflow
+## 1. Daily Morning Checklist
 
-### Switch to the notafilia cluster
+Run this every morning before starting work. Copy-paste the whole block:
 
 ```bash
 use-notafilia
-# or: kubectl config use-context kubernetes-admin@notafilia
+
+echo "=== 1. NODES ==="
+kubectl get nodes
+echo ""
+
+echo "=== 2. ARGOCD APPS ==="
+kubectl get applications -n argocd -o custom-columns='APP:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+echo ""
+
+echo "=== 3. STAGING PODS ==="
+kubectl get pods -n staging
+echo ""
+
+echo "=== 4. PRODUCTION PODS ==="
+kubectl get pods -n production
+echo ""
+
+echo "=== 5. PG CLUSTERS ==="
+kubectl get clusters.postgresql.cnpg.io -A
+echo ""
+
+echo "=== 6. TLS CERTIFICATE ==="
+kubectl get certificate -n traefik
+echo ""
+
+echo "=== 7. ENDPOINTS ==="
+echo -n "Staging:    " && curl -sk -o /dev/null -w "%{http_code}" https://staging.notafilia.es/up && echo ""
+echo -n "Production: " && curl -sk -o /dev/null -w "%{http_code}" https://notafilia.es/up && echo ""
 ```
 
-### Quick health check
+### What "healthy" looks like
+
+| Check | Expected |
+|-------|----------|
+| Nodes | 2/2 Ready |
+| ArgoCD apps | All 7 Synced + Healthy |
+| Staging pods | 5/5 Running (web, celery, beat, pg, redis) |
+| Production pods | 5/5 Running |
+| PG clusters | Both "Cluster in healthy state" |
+| TLS certificate | READY = True |
+| Endpoints | Both return 200 |
+
+### What to do if something is wrong
+
+| Symptom | Action |
+|---------|--------|
+| A pod is `CrashLoopBackOff` | `kubectl logs -n <ns> <pod> --previous` — check the crash reason |
+| A pod is `ImagePullBackOff` | Image tag doesn't exist or `ghcr-credentials` expired. See [Section 10](#10-debugging-failed-deployments) |
+| ArgoCD app is `OutOfSync` | `argocd app sync <name> --grpc-web` — force sync |
+| ArgoCD app is `Degraded` | Click into it in the ArgoCD UI to see which resource is unhealthy |
+| PG cluster not healthy | `kubectl describe cluster notafilia-pg -n <ns>` — check status/events |
+| TLS cert not ready | `kubectl get challenges -A` — check if ACME challenge is stuck |
+| Endpoint returns 503 | Web pods aren't Ready. Check pod status and logs |
+| Node is `NotReady` | Check OVH console — node may be rebooting for security updates |
+
+### Optional: Add as a shell function
+
+Add to `~/.zshrc`:
 
 ```bash
-# Are all apps healthy?
-kubectl get applications -n argocd
-
-# Are all pods running?
-kubectl get pods -n staging
-kubectl get pods -n production
-
-# Test the endpoints
-curl -s https://staging.notafilia.es/up
-curl -s https://notafilia.es/up
+notafilia-status() {
+  use-notafilia
+  echo "=== NODES ===" && kubectl get nodes
+  echo "" && echo "=== ARGOCD ===" && kubectl get applications -n argocd -o custom-columns='APP:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+  echo "" && echo "=== STAGING ===" && kubectl get pods -n staging
+  echo "" && echo "=== PRODUCTION ===" && kubectl get pods -n production
+  echo "" && echo "=== PG ===" && kubectl get clusters.postgresql.cnpg.io -A
+  echo "" && echo "=== TLS ===" && kubectl get certificate -n traefik
+  echo "" && echo "=== ENDPOINTS ==="
+  echo -n "Staging:    " && curl -sk -o /dev/null -w "%{http_code}\n" https://staging.notafilia.es/up
+  echo -n "Production: " && curl -sk -o /dev/null -w "%{http_code}\n" https://notafilia.es/up
+}
 ```
+
+Then just run `notafilia-status` every morning.
 
 ### Watch pods in real-time
 
@@ -285,65 +343,181 @@ sops overlays/staging/secrets.enc.yaml
 
 ## 6. Deploying New Versions
 
-### Deploy to staging (automatic via CI)
+### How CI/CD works
 
-1. Push to `main` branch
-2. GitHub Actions builds and pushes `staging-latest` tag
-3. Restart pods to pull the new image:
-
-```bash
-kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
+```
+Push to main → GitHub Actions → builds linux/amd64 image → pushes to GHCR
+  Tags: {commit-sha} + staging-latest
 ```
 
-### Deploy to staging (manual)
+The workflow file is at `notafilia/.github/workflows/build-and-push.yml`.
+
+### Deploy to staging (automatic via CI)
+
+Every push to `main` auto-builds. To deploy:
+
+```bash
+# 1. Push your code changes to main
+cd ~/Developer/notafilia
+git add . && git commit -m "your change" && git push
+
+# 2. Wait for GitHub Actions to finish (~3-5 min)
+gh run list --repo RafaFuentes4/notafilia --limit 1
+# Wait until STATUS shows "completed" + "success"
+
+# 3. Restart pods to pull the new staging-latest image
+use-notafilia
+kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
+
+# 4. Watch the rollout
+kubectl rollout status deployment notafilia-web -n staging
+
+# 5. Verify
+curl -s https://staging.notafilia.es/up
+```
+
+### Deploy to staging (manual, without CI)
 
 ```bash
 cd ~/Developer/notafilia
 
-# Build for amd64 and push
+# Build for amd64 and push directly
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
   -t ghcr.io/rafafuentes4/notafilia:staging-latest \
   --push .
 
 # Restart pods
+use-notafilia
 kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
 ```
 
-### Promote to production
+### Promote to production (full workflow)
+
+Production uses pinned version tags (e.g., `v1.0.0`, `v1.1.0`). Here's the complete workflow:
 
 ```bash
-# Tag the current staging image
-docker buildx build --platform linux/amd64 \
-  -f Dockerfile.web \
-  -t ghcr.io/rafafuentes4/notafilia:v1.1.0 \
-  --push .
+# 1. Make sure staging is working and tested
+curl -s https://staging.notafilia.es/up  # Should return OK
 
-# Update the production overlay
+# 2. Decide on the version number
+VERSION="v1.1.0"
+
+# 3. Tag the current staging image with the production version
+#    (no rebuild needed — just re-tag the existing image)
+docker pull --platform linux/amd64 ghcr.io/rafafuentes4/notafilia:staging-latest
+docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:$VERSION
+docker push ghcr.io/rafafuentes4/notafilia:$VERSION
+
+# 4. Update the production overlay in the infra repo
+cd ~/Developer/notafilia-infra
+cd overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:$VERSION
+cd ../..
+
+# 5. Commit and push the infra change
+git add overlays/production/kustomization.yaml
+git commit -m "Promote $VERSION to production"
+git push
+
+# 6. ArgoCD auto-syncs within 3 minutes, or force it:
+argocd app sync notafilia-production --grpc-web
+
+# 7. Watch the rollout
+kubectl rollout status deployment notafilia-web -n production
+
+# 8. Verify
+curl -s https://notafilia.es/up
+```
+
+### Alternative: Tag with GitHub Release
+
+You can also trigger production builds via GitHub tags:
+
+```bash
+cd ~/Developer/notafilia
+
+# 1. Create a Git tag
+git tag v1.1.0
+git push origin v1.1.0
+
+# 2. Create a GitHub Release (optional, nice for changelog)
+gh release create v1.1.0 --title "v1.1.0" --notes "Description of changes"
+```
+
+To make this auto-build, add a tag trigger to the CI workflow:
+
+```yaml
+# In .github/workflows/build-and-push.yml, add to the 'on' section:
+on:
+  push:
+    branches: [main]
+    tags: ['v*']      # Also trigger on version tags
+```
+
+And add a conditional tag in the build step:
+
+```yaml
+tags: |
+  ghcr.io/rafafuentes4/notafilia:${{ github.sha }}
+  ghcr.io/rafafuentes4/notafilia:staging-latest
+  ${{ startsWith(github.ref, 'refs/tags/v') && format('ghcr.io/rafafuentes4/notafilia:{0}', github.ref_name) || '' }}
+```
+
+Then promoting to production becomes:
+
+```bash
+# 1. Tag and push in the app repo
+cd ~/Developer/notafilia
+git tag v1.1.0 && git push origin v1.1.0
+
+# 2. Wait for CI to build the tagged image
+gh run list --repo RafaFuentes4/notafilia --limit 1
+
+# 3. Update production overlay in infra repo
 cd ~/Developer/notafilia-infra/overlays/production
 kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
-git add . && git commit -m "Promote v1.1.0 to production" && git push
-
-# ArgoCD auto-syncs within 3 minutes, or force it:
-argocd app sync notafilia-production --grpc-web
+cd ../..
+git commit -am "Promote v1.1.0 to production" && git push
 ```
 
 ### Rollback
 
+#### Quick rollback (temporary)
+
 ```bash
-# Option 1: Revert the image tag in Git
+# Undo the last deployment — K8s reverts to previous ReplicaSet
+kubectl rollout undo deployment notafilia-web -n production
+kubectl rollout undo deployment notafilia-celery -n production
+kubectl rollout undo deployment notafilia-beat -n production
+```
+
+> **Note**: ArgoCD will revert this within 3 minutes (self-heal). Use this for immediate relief while you fix the Git state.
+
+#### Permanent rollback (via Git)
+
+```bash
 cd ~/Developer/notafilia-infra/overlays/production
 kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.0.0  # Previous version
-git commit -am "Rollback to v1.0.0" && git push
-
-# Option 2: Rollback the Deployment directly (temporary, ArgoCD will revert)
-kubectl rollout undo deployment notafilia-web -n production
+cd ../..
+git commit -am "Rollback production to v1.0.0" && git push
 ```
 
 ### Check deployment status
 
 ```bash
+# Is the rollout complete?
 kubectl rollout status deployment notafilia-web -n staging
+
+# What image is currently running?
+kubectl get pods -n staging -l app.kubernetes.io/component=web \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+
+# Deployment history
+kubectl rollout history deployment notafilia-web -n staging
+
+# Check GitHub Actions build status
+gh run list --repo RafaFuentes4/notafilia --limit 5
 ```
 
 ---
