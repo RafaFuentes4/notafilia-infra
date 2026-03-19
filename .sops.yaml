@@ -2,11 +2,9 @@ creation_rules:
   # Staging secrets
   - path_regex: overlays/staging/.*\.enc\.yaml$
     age: >-
-      age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    # Replace with your actual age public key
+      age1gg0wxkdew42q0glwhp4efy83cna825stw9l8n6merxr2znm8t4esvak57u
 
   # Production secrets
   - path_regex: overlays/production/.*\.enc\.yaml$
     age: >-
-      age1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
-    # Can use same or different key for production
+      age1gg0wxkdew42q0glwhp4efy83cna825stw9l8n6merxr2znm8t4esvak57u
