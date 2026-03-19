@@ -346,139 +346,155 @@ sops overlays/staging/secrets.enc.yaml
 ### How CI/CD works
 
 ```
-Push to main → GitHub Actions → builds linux/amd64 image → pushes to GHCR
-  Tags: {commit-sha} + staging-latest
+Developer → feature branch → merge to main → tag vX.Y.Z → push tag
+                                                   ↓
+                                          GitHub Actions builds image
+                                                   ↓
+                                          GHCR: ghcr.io/rafafuentes4/notafilia:X.Y.Z
+                                                   ↓
+                              Update notafilia-infra → newTag: "X.Y.Z" → push
+                                                   ↓
+                              ArgoCD detects change → deploys new image → done
 ```
 
-The workflow file is at `notafilia/.github/workflows/build-and-push.yml`.
+The CI workflow (`notafilia/.github/workflows/build-and-push.yml`) triggers on:
+- **Push to `main`** → tags image as `sha-xxx` + `staging-latest`
+- **Version tag `v*`** → tags image as `X.Y.Z` + `X.Y` + `sha-xxx`
 
-### Deploy to staging (automatic via CI)
+### Walkthrough: Deploy a change (tested and verified)
 
-Every push to `main` auto-builds. To deploy:
+This is the exact workflow we used to deploy the "Start collecting" CTA change.
+
+#### Step 1: Create a feature branch and make your change
 
 ```bash
-# 1. Push your code changes to main
 cd ~/Developer/notafilia
-git add . && git commit -m "your change" && git push
+git checkout -b feature/my-change
 
-# 2. Wait for GitHub Actions to finish (~3-5 min)
-gh run list --repo RafaFuentes4/notafilia --limit 1
-# Wait until STATUS shows "completed" + "success"
+# Make your changes...
+# Edit templates, code, etc.
+```
 
-# 3. Restart pods to pull the new staging-latest image
+#### Step 2: Run checks locally
+
+```bash
+# Python linting
+make ruff
+
+# TypeScript type check
+make npm-type-check
+
+# Django tests
+make test ARGS='--keepdb'
+```
+
+All must pass — CI runs the same checks.
+
+#### Step 3: Commit and merge to main
+
+```bash
+git add . && git commit -m "feat: description of change"
+
+# Merge to main
+git checkout main
+git merge feature/my-change
+git push
+```
+
+#### Step 4: Create a version tag
+
+```bash
+# Choose the next version (semver: major.minor.patch)
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+This triggers two CI builds:
+- One for the `main` push (creates `staging-latest`)
+- One for the `v0.2.0` tag (creates `0.2.0` and `0.2`)
+
+#### Step 5: Wait for CI to finish
+
+```bash
+# Watch the builds
+gh run list --repo RafaFuentes4/notafilia --limit 4
+
+# All should show "completed" + "success" (~1-3 minutes)
+```
+
+#### Step 6: Update the infra repo
+
+```bash
+cd ~/Developer/notafilia-infra
+
+# Update staging
+cd overlays/staging
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.2.0
+cd ../..
+
+# Update production (same version, or keep the old one if you want to test staging first)
+cd overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.2.0
+cd ../..
+
+# Commit and push
+git add overlays/
+git commit -m "chore: update image tag to 0.2.0 in staging and production"
+git push
+```
+
+#### Step 7: ArgoCD deploys automatically
+
+ArgoCD detects the tag change within ~3 minutes and rolls out new pods. You can watch:
+
+```bash
 use-notafilia
-kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
 
-# 4. Watch the rollout
-kubectl rollout status deployment notafilia-web -n staging
+# Watch staging pods restart
+kubectl get pods -n staging --watch
 
-# 5. Verify
+# Or check ArgoCD
+kubectl get applications -n argocd
+```
+
+#### Step 8: Verify
+
+```bash
+# Check running image
+kubectl get pods -n staging -l app.kubernetes.io/component=web \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+# Should show: ghcr.io/rafafuentes4/notafilia:0.2.0
+
+# Test the app
 curl -s https://staging.notafilia.es/up
 ```
 
-### Deploy to staging (manual, without CI)
+### Deploy only to staging (test before production)
+
+Same as above, but only update `overlays/staging/kustomization.yaml`. Keep production on the previous tag. Once you've tested staging:
+
+```bash
+cd ~/Developer/notafilia-infra/overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.2.0
+cd ../..
+git commit -am "chore: promote 0.2.0 to production" && git push
+```
+
+### Deploy manually (without CI, for debugging)
 
 ```bash
 cd ~/Developer/notafilia
 
-# Build for amd64 and push directly
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
-  -t ghcr.io/rafafuentes4/notafilia:staging-latest \
+  -t ghcr.io/rafafuentes4/notafilia:manual-test \
   --push .
 
-# Restart pods
-use-notafilia
-kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
-```
-
-### Promote to production (full workflow)
-
-Production uses pinned version tags (e.g., `v1.0.0`, `v1.1.0`). Here's the complete workflow:
-
-```bash
-# 1. Make sure staging is working and tested
-curl -s https://staging.notafilia.es/up  # Should return OK
-
-# 2. Decide on the version number
-VERSION="v1.1.0"
-
-# 3. Tag the current staging image with the production version
-#    (no rebuild needed — just re-tag the existing image)
-docker pull --platform linux/amd64 ghcr.io/rafafuentes4/notafilia:staging-latest
-docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:$VERSION
-docker push ghcr.io/rafafuentes4/notafilia:$VERSION
-
-# 4. Update the production overlay in the infra repo
-cd ~/Developer/notafilia-infra
-cd overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:$VERSION
+# Update infra repo to use the manual tag
+cd ~/Developer/notafilia-infra/overlays/staging
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:manual-test
 cd ../..
-
-# 5. Commit and push the infra change
-git add overlays/production/kustomization.yaml
-git commit -m "Promote $VERSION to production"
-git push
-
-# 6. ArgoCD auto-syncs within 3 minutes, or force it:
-argocd app sync notafilia-production --grpc-web
-
-# 7. Watch the rollout
-kubectl rollout status deployment notafilia-web -n production
-
-# 8. Verify
-curl -s https://notafilia.es/up
-```
-
-### Alternative: Tag with GitHub Release
-
-You can also trigger production builds via GitHub tags:
-
-```bash
-cd ~/Developer/notafilia
-
-# 1. Create a Git tag
-git tag v1.1.0
-git push origin v1.1.0
-
-# 2. Create a GitHub Release (optional, nice for changelog)
-gh release create v1.1.0 --title "v1.1.0" --notes "Description of changes"
-```
-
-To make this auto-build, add a tag trigger to the CI workflow:
-
-```yaml
-# In .github/workflows/build-and-push.yml, add to the 'on' section:
-on:
-  push:
-    branches: [main]
-    tags: ['v*']      # Also trigger on version tags
-```
-
-And add a conditional tag in the build step:
-
-```yaml
-tags: |
-  ghcr.io/rafafuentes4/notafilia:${{ github.sha }}
-  ghcr.io/rafafuentes4/notafilia:staging-latest
-  ${{ startsWith(github.ref, 'refs/tags/v') && format('ghcr.io/rafafuentes4/notafilia:{0}', github.ref_name) || '' }}
-```
-
-Then promoting to production becomes:
-
-```bash
-# 1. Tag and push in the app repo
-cd ~/Developer/notafilia
-git tag v1.1.0 && git push origin v1.1.0
-
-# 2. Wait for CI to build the tagged image
-gh run list --repo RafaFuentes4/notafilia --limit 1
-
-# 3. Update production overlay in infra repo
-cd ~/Developer/notafilia-infra/overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
-cd ../..
-git commit -am "Promote v1.1.0 to production" && git push
+git commit -am "chore: deploy manual-test to staging" && git push
 ```
 
 ### Rollback
@@ -498,9 +514,9 @@ kubectl rollout undo deployment notafilia-beat -n production
 
 ```bash
 cd ~/Developer/notafilia-infra/overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.0.0  # Previous version
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.1.0  # Previous version
 cd ../..
-git commit -am "Rollback production to v1.0.0" && git push
+git commit -am "chore: rollback production to 0.1.0" && git push
 ```
 
 ### Check deployment status
@@ -518,6 +534,20 @@ kubectl rollout history deployment notafilia-web -n staging
 
 # Check GitHub Actions build status
 gh run list --repo RafaFuentes4/notafilia --limit 5
+```
+
+### Version numbering convention
+
+Follow [semver](https://semver.org/):
+- **Patch** (`0.1.1`) — bug fixes, small changes
+- **Minor** (`0.2.0`) — new features, non-breaking changes
+- **Major** (`1.0.0`) — breaking changes, major milestones
+
+```bash
+# See existing tags
+git tag --list 'v*' --sort=-v:refname
+
+# Current: v0.1.0
 ```
 
 ---
