@@ -9,8 +9,6 @@ spec:
     repoURL: https://github.com/RafaFuentes4/notafilia-infra.git
     targetRevision: main
     path: overlays/staging
-    plugin:
-      name: kustomize-sops
   destination:
     server: https://kubernetes.default.svc
     namespace: staging
