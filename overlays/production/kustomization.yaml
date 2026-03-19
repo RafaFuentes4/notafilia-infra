@@ -5,7 +5,8 @@ namespace: production
 
 resources:
   - ../../base
-  - secrets.enc.yaml
+  # secrets.enc.yaml is SOPS-encrypted and applied directly to the cluster.
+  # Will be managed by ArgoCD once KSOPS plugin is configured.
 
 patches:
   - target:
