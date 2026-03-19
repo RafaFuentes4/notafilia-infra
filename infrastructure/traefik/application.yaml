@@ -17,6 +17,15 @@ spec:
           kubernetesGateway:
             enabled: true
 
+        # Redirect all HTTP to HTTPS
+        ports:
+          web:
+            redirections:
+              entryPoint:
+                to: websecure
+                scheme: https
+                permanent: true
+
         gateway:
           enabled: true
           name: traefik-gateway

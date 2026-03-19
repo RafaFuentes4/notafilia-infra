@@ -1,0 +1,41 @@
+name: Update Image Tag
+
+on:
+  repository_dispatch:
+    types: [update-image]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Update staging tag
+        if: github.event.client_payload.environment == 'staging' || github.event.client_payload.environment == 'both'
+        run: |
+          cd overlays/staging
+          kustomize edit set image ghcr.io/rafafuentes4/notafilia:${{ github.event.client_payload.tag }}
+
+      - name: Update production tag
+        if: github.event.client_payload.environment == 'both'
+        run: |
+          cd overlays/production
+          kustomize edit set image ghcr.io/rafafuentes4/notafilia:${{ github.event.client_payload.tag }}
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add overlays/
+          TAG="${{ github.event.client_payload.tag }}"
+          ENV="${{ github.event.client_payload.environment }}"
+          if [ "$ENV" = "both" ]; then
+            git commit -m "chore: update image tag to ${TAG} in staging and production"
+          else
+            git commit -m "chore: update image tag to ${TAG} in ${ENV}"
+          fi
+          git push
