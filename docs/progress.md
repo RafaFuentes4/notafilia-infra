@@ -1,35 +1,79 @@
-# Notafilia K8s Infrastructure — Step-by-Step Setup Guide
+# Notafilia K8s Infrastructure — Complete Setup Guide
 
-This guide documents every step taken to deploy the Notafilia Django application to Kubernetes on OVH. A junior developer should be able to follow this from scratch to get a running deployment.
+This guide documents every step to deploy the Notafilia Django application to Kubernetes on OVH from scratch. It includes the exact commands, configuration files, pitfalls encountered, and their solutions.
+
+**Final state**: Django app (web + celery + celery beat) running on OVH Managed Kubernetes with HTTPS, PostgreSQL (CloudNativePG), Redis, Traefik Gateway API routing, cert-manager TLS, and ArgoCD GitOps — across staging and production environments.
 
 ---
 
-## Prerequisites
+## Table of Contents
 
-### Tools to install (macOS)
+1. [Prerequisites](#1-prerequisites)
+2. [Phase 1: Repository Setup](#2-phase-1-repository-setup)
+3. [Phase 2: OVH Cluster](#3-phase-2-ovh-cluster)
+4. [Phase 3: ArgoCD + Infrastructure](#4-phase-3-argocd--infrastructure)
+5. [Phase 4: App Deployment](#5-phase-4-app-deployment)
+6. [Phase 5: TLS/HTTPS](#6-phase-5-tlshttps)
+7. [Phase 6: CI/CD](#7-phase-6-cicd)
+8. [Phase 7: DNS](#8-phase-7-dns)
+9. [Post-Deployment Tasks](#9-post-deployment-tasks)
+10. [Final Architecture](#10-final-architecture)
+11. [Gotchas & Lessons Learned](#11-gotchas--lessons-learned)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Common Operations](#13-common-operations)
+
+---
+
+## 1. Prerequisites
+
+### Tools (macOS)
 
 ```bash
 brew install kubectl argocd helm sops age kustomize
 ```
 
-### Accounts needed
-- **OVH Public Cloud** account with billing configured
-- **GitHub** account with the `notafilia` and `notafilia-infra` repos
-- **Domain registrar** access for DNS (we use GoDaddy for `notafilia.es`)
+Verified versions:
+- kubectl v1.32.7
+- argocd v3.3.4
+- helm v4.1.3
+- sops 3.12.2
+- age v1.3.1
+- kustomize v5.8.1
+
+### Accounts
+- **OVH Public Cloud** with billing configured
+- **GitHub** account with repos: `notafilia` (app) and `notafilia-infra` (infrastructure)
+- **Domain registrar** for DNS (we use GoDaddy for `notafilia.es`)
+
+### Technology Stack
+
+| Layer | Tool | Why |
+|-------|------|-----|
+| GitOps | ArgoCD | Visual UI, 60% market share, great for learning |
+| App manifests | Kustomize | Plain YAML + overlays, no Go templates |
+| Infrastructure | Helm | For third-party charts only |
+| Ingress | Traefik + Gateway API | ingress-nginx EOL March 2026 |
+| TLS | cert-manager + Let's Encrypt | ACME HTTP-01 via Gateway API |
+| Secrets | SOPS + age | Value-level encryption, no controller needed |
+| PostgreSQL | CloudNativePG | Purpose-built operator, automated failover |
+| Redis | Official redis:7-alpine | Bitnami images no longer free (Sep 2025) |
+| CI/CD | GitHub Actions → GHCR | Native OIDC auth, free for public repos |
+| Cluster | OVH Managed K8s | Free control plane, pay only for nodes |
 
 ---
 
-## Phase 1: Repository Setup
+## 2. Phase 1: Repository Setup
 
-### 1.1 Create the infra repo
+### 2.1 Create the repo
 
 ```bash
 cd ~/Developer
 mkdir notafilia-infra && cd notafilia-infra
 git init
+gh repo create RafaFuentes4/notafilia-infra --private --source=. --push
 ```
 
-### 1.2 Create directory structure
+### 2.2 Directory structure
 
 ```bash
 mkdir -p base
@@ -39,64 +83,77 @@ mkdir -p infrastructure/cloudnative-pg infrastructure/redis
 mkdir -p argocd docs
 ```
 
-### 1.3 Create all manifest files
+### 2.3 Repository layout (final)
 
-The complete file contents are in `docs/implementation-spec.md`. Here's what each file does:
+```
+notafilia-infra/
+├── base/                              # Kustomize base (environment-agnostic)
+│   ├── kustomization.yaml             # Resource list + labels
+│   ├── deployment-web.yaml            # Gunicorn + migrate init container
+│   ├── deployment-celery.yaml         # Celery worker
+│   ├── deployment-beat.yaml           # Celery beat (Recreate strategy)
+│   ├── service-web.yaml               # ClusterIP:8000
+│   ├── configmap.yaml                 # Non-secret env vars
+│   └── httproute.yaml                 # Gateway API route
+├── overlays/
+│   ├── staging/
+│   │   ├── kustomization.yaml         # Patches for staging
+│   │   └── secrets.enc.yaml           # SOPS-encrypted secrets
+│   └── production/
+│       ├── kustomization.yaml         # Patches for production
+│       └── secrets.enc.yaml           # SOPS-encrypted secrets
+├── infrastructure/                    # Third-party services (ArgoCD managed)
+│   ├── traefik/application.yaml       # Traefik Helm chart (34.*)
+│   ├── cert-manager/
+│   │   ├── application.yaml           # cert-manager Helm chart (v1.*)
+│   │   ├── cluster-issuer.yaml        # Let's Encrypt ACME issuer
+│   │   └── certificate.yaml           # TLS cert for both domains
+│   ├── cloudnative-pg/
+│   │   ├── application.yaml           # CNPG operator (pinned 0.25.0)
+│   │   ├── cluster-staging.yaml       # 1 PG instance, 10Gi
+│   │   └── cluster-production.yaml    # 1 PG instance, 20Gi
+│   └── redis/
+│       ├── staging.yaml               # redis:7-alpine + PVC + Service
+│       └── production.yaml            # Same for production
+├── argocd/                            # App-of-apps bootstrap
+│   ├── app-of-apps.yaml               # Root Application
+│   ├── infrastructure.yaml            # Infrastructure Application
+│   ├── staging.yaml                   # Staging Application
+│   └── production.yaml                # Production Application
+├── .sops.yaml                         # SOPS encryption config
+├── .gitignore                         # Excludes kubeconfig files
+└── README.md
+```
 
-**`base/`** — Kustomize base manifests (environment-agnostic):
-- `kustomization.yaml` — Lists all resources, applies `app.kubernetes.io/name: notafilia` labels
-- `deployment-web.yaml` — Gunicorn deployment with init container for `manage.py migrate`
-- `deployment-celery.yaml` — Celery worker (`--pool threads --concurrency 20`)
-- `deployment-beat.yaml` — Celery beat (replicas: 1, strategy: Recreate to avoid duplicate tasks)
-- `service-web.yaml` — ClusterIP service on port 8000
-- `configmap.yaml` — Non-secret env vars (DJANGO_SETTINGS_MODULE, ALLOWED_HOSTS, etc.)
-- `httproute.yaml` — Gateway API route pointing to notafilia-web:8000
+### 2.4 Key design decisions
 
-**`overlays/staging/`** — Patches for staging:
-- `kustomization.yaml` — Sets namespace: staging, host: staging.notafilia.es, image tag: staging-latest
-- `secrets.enc.yaml` — SOPS-encrypted secrets (DATABASE_URL, SECRET_KEY, etc.)
+- **Kustomize for the app** — overlays patch base YAML per environment. No Go templates.
+- **Helm only for third-party charts** — Traefik, cert-manager, CloudNativePG operator.
+- **ArgoCD app-of-apps** — one root Application bootstraps everything from Git.
+- **Init container for migrations** — `manage.py migrate` runs before Gunicorn starts.
+- **Beat strategy: Recreate** — prevents duplicate scheduled tasks during deployments.
+- **`/up` for health probes** (not `/health/`) — `/up` uses Django middleware that bypasses `ALLOWED_HOSTS` validation. `/health/` gets blocked when accessed via pod IP.
+- **`imagePullSecrets` on all deployments** — GHCR packages are private by default.
+- **redis:7-alpine instead of Bitnami** — Broadcom ended free Bitnami images in Sep 2025.
+- **Gateway `namespacePolicy: All`** — allows HTTPRoutes in staging/production to reference the Gateway in the traefik namespace.
+- **Pin CNPG operator version** — wildcard versions cause auto-upgrade bootstrap loops.
+- **Sync-wave annotations** — CRD-dependent resources (ClusterIssuer, PG Clusters) use `sync-wave: "1"` so operators install first.
 
-**`overlays/production/`** — Patches for production:
-- `kustomization.yaml` — Sets namespace: production, host: notafilia.es, image tag: v1.0.0
-
-**`infrastructure/`** — Third-party services as ArgoCD Applications:
-- `traefik/application.yaml` — Traefik v3 Helm chart with Gateway API + LoadBalancer
-- `cert-manager/application.yaml` — cert-manager Helm chart
-- `cert-manager/cluster-issuer.yaml` — Let's Encrypt ClusterIssuer (sync-wave: 1)
-- `cloudnative-pg/application.yaml` — CNPG operator Helm chart (pinned to 0.25.0, ServerSideApply)
-- `cloudnative-pg/cluster-staging.yaml` — PG cluster: 1 instance, 10Gi (sync-wave: 1)
-- `cloudnative-pg/cluster-production.yaml` — PG cluster: 1 instance, 20Gi (sync-wave: 1)
-- `redis/staging.yaml` — redis:7-alpine Deployment + PVC + Service
-- `redis/production.yaml` — Same for production namespace
-
-**`argocd/`** — App-of-apps bootstrap:
-- `app-of-apps.yaml` — Root Application that manages the `argocd/` directory
-- `infrastructure.yaml` — Scans `infrastructure/` recursively with SkipDryRunOnMissingResource
-- `staging.yaml` — Points to `overlays/staging` (Kustomize)
-- `production.yaml` — Points to `overlays/production` (prune: false for safety)
-
-### 1.4 Validate locally
+### 2.5 Validate locally
 
 ```bash
 kubectl kustomize base/                  # Should render valid YAML
-kubectl kustomize overlays/staging/      # Should show staging patches applied
-kubectl kustomize overlays/production/   # Should show production patches applied
+kubectl kustomize overlays/staging/      # Should show staging patches
+kubectl kustomize overlays/production/   # Should show production patches
 ```
-
-### 1.5 Key gotchas discovered during Phase 1
-
-1. **Use `labels` instead of `commonLabels`** in kustomization.yaml — `commonLabels` is deprecated.
-2. **Bitnami images are no longer free** (Broadcom ended the program Sep 2025). Use official `redis:7-alpine` with plain manifests instead of the Bitnami Helm chart.
-3. **All deployments need `imagePullSecrets`** if using a private GHCR registry.
-4. **Health probes must use `/up`** (middleware-based), not `/health/` — the latter is blocked by Django's `ALLOWED_HOSTS` when accessed via pod IP.
 
 ---
 
-## Phase 2: OVH Cluster
+## 3. Phase 2: OVH Cluster
 
-### 2.1 Create the cluster
+### 3.1 Create the cluster
 
-Go to **OVH Manager → Public Cloud → Managed Kubernetes → Create a cluster**:
+OVH Manager → Public Cloud → Managed Kubernetes → Create:
 
 | Setting | Value |
 |---------|-------|
@@ -104,31 +161,29 @@ Go to **OVH Manager → Public Cloud → Managed Kubernetes → Create a cluster
 | Region | Gravelines (GRA9), 1-AZ |
 | Plan | Free |
 | K8s version | Latest stable (1.34) |
-| Security policy | Maximum security (recommended) |
+| Security policy | Maximum security |
 | Private network | None (public IPs) |
-| Node pool | B3-8 (8GB RAM, 2 vCPU), **2 nodes** |
+| Node pool flavor | B3-8 (8GB RAM, 2 vCPU, 50GB NVMe) |
+| **Node count** | **2** |
 | Auto-scaling | Off |
-| Anti-affinity | Off |
-| Billing | Hourly |
+| Billing | Hourly (~68€/month for 2 nodes) |
 | Pool name | `general` |
 
-> **Important:** Use 2 nodes minimum. A single B3-8 node doesn't have enough CPU for all infrastructure + app pods. We initially tried 1 node and hit `Insufficient cpu` scheduling failures.
+> **Critical: Use 2 nodes minimum.** A single B3-8 doesn't have enough CPU for all infrastructure + app pods. We initially tried 1 node and hit `Insufficient cpu` scheduling failures.
 
-Wait ~5-10 minutes for the cluster to provision.
+Wait ~5-10 minutes for provisioning.
 
-### 2.2 Configure kubectl
-
-Download the kubeconfig from OVH Manager and save it:
+### 3.2 Configure kubectl
 
 ```bash
-# Move the downloaded file
+# Download kubeconfig from OVH Manager → cluster → "Download kubeconfig"
 mv ~/Downloads/kubeconfig-*.yml ~/.kube/notafilia-ovh.yaml
 
-# Add to KUBECONFIG in ~/.zshrc
+# Add to ~/.zshrc
 export KUBECONFIG="$HOME/.kube/notafilia-ovh.yaml"
-# (or append to existing KUBECONFIG with colon separator)
+# (or append with colon if you have other clusters)
 
-# Add convenience alias
+# Convenience alias
 alias use-notafilia='kubectl config use-context kubernetes-admin@notafilia'
 
 # Verify
@@ -137,76 +192,76 @@ use-notafilia
 kubectl get nodes  # Should show 2 Ready nodes
 ```
 
-### 2.3 Create namespaces
+### 3.3 Create namespaces
 
 ```bash
 kubectl create namespace staging
 kubectl create namespace production
 ```
 
-### 2.4 Verify storage class
+### 3.4 Verify storage class
 
 ```bash
 kubectl get storageclass
-# Should show csi-cinder-high-speed (default) — this is what our PG manifests use
+# csi-cinder-high-speed (default) — this is what PG and Redis manifests use
 ```
 
-### 2.5 Generate SOPS encryption keys
+### 3.5 Generate SOPS encryption keys
 
 ```bash
-# Generate age keypair
+mkdir -p ~/.config/sops/age
 age-keygen -o ~/.config/sops/age/keys.txt
-# Output shows: Public key: age1xxxxxx...
+# Output: Public key: age1xxxxxx...
 
-# BACK UP THE PRIVATE KEY to a password manager (1Password, etc.)
-# If lost, you'll need to re-encrypt all secrets
+# BACK UP the private key to 1Password (or other password manager)
 cat ~/.config/sops/age/keys.txt
 ```
 
-Update `.sops.yaml` with your real public key and commit.
+Update `.sops.yaml` with your actual public key, commit, and push.
 
 ---
 
-## Phase 3: ArgoCD + Infrastructure
+## 4. Phase 3: ArgoCD + Infrastructure
 
-### 3.1 Install ArgoCD
+### 4.1 Install ArgoCD
 
 ```bash
 kubectl create namespace argocd
 
-# Install ArgoCD
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-# If you get "annotations too long" error on applicationsets CRD:
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
+# If "annotations too long" error on CRDs:
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
   --server-side --force-conflicts
 
-# Wait for all pods
+# Wait for pods
 kubectl wait --for=condition=Ready pods --all -n argocd --timeout=180s
 
 # Get admin password
 argocd admin initial-password -n argocd
 
-# Access the UI
+# Access UI
 kubectl port-forward svc/argocd-server -n argocd 8080:443
-# Open https://localhost:8080, login with admin + password above
+# Open https://localhost:8080 → login admin + password
 ```
 
-### 3.2 Install Gateway API CRDs
+### 4.2 Install Gateway API CRDs
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
 ```
 
-### 3.3 Mount SOPS age key in ArgoCD
+### 4.3 Mount SOPS age key in ArgoCD
 
 ```bash
-# Create the secret
+# Create secret
 kubectl create secret generic age-key \
   --from-file=keys.txt=$HOME/.config/sops/age/keys.txt \
   -n argocd
 
-# Patch repo-server to mount it
+# Patch repo-server
 kubectl patch deployment argocd-repo-server -n argocd --type json -p '[
   {
     "op": "add",
@@ -225,94 +280,77 @@ kubectl patch deployment argocd-repo-server -n argocd --type json -p '[
   }
 ]'
 
-# Wait for restart
 kubectl rollout status deployment argocd-repo-server -n argocd --timeout=120s
 ```
 
-### 3.4 Deploy the app-of-apps
+### 4.4 Deploy the app-of-apps
 
 ```bash
-# This single command bootstraps EVERYTHING
 kubectl apply -f argocd/app-of-apps.yaml
 ```
 
-ArgoCD will:
-1. Read `argocd/` directory → create child Applications
-2. `notafilia-infrastructure` scans `infrastructure/` → creates Traefik, cert-manager, CNPG, Redis
+This single command bootstraps everything:
+1. ArgoCD reads `argocd/` → creates child Applications
+2. `notafilia-infrastructure` scans `infrastructure/` → deploys Traefik, cert-manager, CNPG, Redis
 3. `notafilia-staging` and `notafilia-production` deploy app overlays
-
-### 3.5 Key gotchas discovered during Phase 3
-
-1. **CRD ordering**: CloudNativePG Cluster CRs and ClusterIssuers depend on CRDs from their operators. Use `argocd.argoproj.io/sync-wave: "1"` annotations on dependent resources and `SkipDryRunOnMissingResource=true` on the infrastructure Application.
-
-2. **Traefik chart v34 schema change**: `gateway.listeners` must be a map (`web: {port: 8000}`) not an array (`- name: web`). Ports are Traefik internal ports (8000/8443), not external (80/443).
-
-3. **Gateway `namespacePolicy: All`**: Without this, HTTPRoutes in staging/production namespaces can't reference the Gateway in the traefik namespace. You'll see `NotAllowedByListeners` in the HTTPRoute status.
-
-4. **CloudNativePG `poolers` CRD too large**: Requires `ServerSideApply=true` in the operator's ArgoCD Application.
-
-5. **Don't use wildcard chart versions** (`0.*`) for CNPG: Auto-upgrades cause bootstrap image version mismatches that put PG clusters in endless restart loops. Pin to a specific version like `0.25.0`.
-
-6. **`ServerSideApply` conflicts with `--force`** in ArgoCD retry loops: Don't use both. Use `SkipDryRunOnMissingResource` alone on the infrastructure Application.
 
 ---
 
-## Phase 4: App Deployment
+## 5. Phase 4: App Deployment
 
-### 4.1 Build and push Docker image
+### 5.1 Build and push Docker image
 
-> **Critical**: Build for `linux/amd64` — OVH nodes are x86_64, your Mac is ARM.
+> **Critical**: Build for `linux/amd64` — OVH nodes are x86_64, your Mac is ARM. Building without `--platform` gives `exec format error`.
 
 ```bash
 cd ~/Developer/notafilia
 
-# Login to GHCR (need write:packages scope)
+# Ensure GHCR write access
 gh auth refresh -h github.com -s write:packages,read:packages
-gh auth token | docker login ghcr.io -u <your-github-username> --password-stdin
+gh auth token | docker login ghcr.io -u <github-username> --password-stdin
 
-# Build for amd64 and push
+# Build and push for amd64
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
-  -t ghcr.io/<your-github-username>/notafilia:staging-latest \
+  -t ghcr.io/rafafuentes4/notafilia:staging-latest \
   --push .
 
 # Also tag for production
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
-  -t ghcr.io/<your-github-username>/notafilia:v1.0.0 \
+  -t ghcr.io/rafafuentes4/notafilia:v1.0.0 \
   --push .
 ```
 
-> **Gotcha**: If you build without `--platform linux/amd64`, the image will be ARM and you'll get `exec format error` in the pods.
+### 5.2 Configure GHCR package permissions
 
-### 4.2 Create imagePullSecret
+GHCR packages are private by default. Go to:
+**https://github.com/users/RafaFuentes4/packages/container/notafilia/settings**
 
-GHCR packages are private by default. Pods need credentials to pull:
+Under **Manage Actions access** → Add Repository → `notafilia` → Role: **Write**
+
+### 5.3 Create imagePullSecret in both namespaces
 
 ```bash
 gh auth token | xargs -I {} kubectl create secret docker-registry ghcr-credentials \
   --docker-server=ghcr.io \
-  --docker-username=<your-github-username> \
+  --docker-username=RafaFuentes4 \
   --docker-password={} \
   -n staging
 
 gh auth token | xargs -I {} kubectl create secret docker-registry ghcr-credentials \
   --docker-server=ghcr.io \
-  --docker-username=<your-github-username> \
+  --docker-username=RafaFuentes4 \
   --docker-password={} \
   -n production
 ```
 
-All deployments reference this secret via `imagePullSecrets: [{name: ghcr-credentials}]` in the pod spec.
+### 5.4 Create app secrets
 
-### 4.3 Create secrets in the cluster
-
-Get the auto-generated PostgreSQL passwords:
+Get CloudNativePG auto-generated passwords:
 
 ```bash
-# Staging
 kubectl get secret notafilia-pg-app -n staging -o jsonpath='{.data.password}' | base64 -d
-# Production
 kubectl get secret notafilia-pg-app -n production -o jsonpath='{.data.password}' | base64 -d
 ```
 
@@ -322,7 +360,7 @@ Generate a Django SECRET_KEY:
 python3 -c "from secrets import token_urlsafe; print(token_urlsafe(50))"
 ```
 
-Create the secrets (replace placeholders):
+Create secrets (replace `<placeholders>`):
 
 ```bash
 kubectl apply -n staging -f - <<EOF
@@ -335,7 +373,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false
 type: Opaque
 stringData:
-  SECRET_KEY: "<generated-secret-key>"
+  SECRET_KEY: "<generated-key>"
   DATABASE_URL: "postgresql://notafilia:<staging-pg-password>@notafilia-pg-rw.staging:5432/notafilia"
   REDIS_URL: "redis://redis-master.staging:6379/0"
   AWS_ACCESS_KEY_ID: ""
@@ -349,153 +387,410 @@ stringData:
 EOF
 ```
 
-Repeat for production (use the production PG password and `redis-master.production`).
+Repeat for production with production PG password and `redis-master.production`.
 
-> **Important**: The `argocd.argoproj.io/compare-options: IgnoreExtraneous` annotation prevents ArgoCD from pruning secrets it doesn't manage. Without this, ArgoCD deletes the secret on every sync because it's not in the Kustomize resources.
+> **Important**: The `argocd.argoproj.io/compare-options: IgnoreExtraneous` annotation prevents ArgoCD from pruning this secret (since it's not in the Kustomize resources).
 
-> **Note on SOPS**: The secrets files in the repo are SOPS-encrypted for Git safety. However, ArgoCD doesn't have a SOPS decryption plugin configured yet, so secrets are applied directly to the cluster with `kubectl apply`. This will be improved in a future phase.
-
-### 4.4 Restart deployments
-
-After secrets and images are in place:
+### 5.5 Restart deployments
 
 ```bash
 kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging
 kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n production
 ```
 
-### 4.5 Key gotchas discovered during Phase 4
+### 5.6 Verify
 
-1. **GHCR token scope**: The default `gh auth` token doesn't have `write:packages`. Run `gh auth refresh -h github.com -s write:packages,read:packages` first.
-
-2. **Build architecture**: Always use `docker buildx build --platform linux/amd64`. Without this, ARM images cause `exec format error`.
-
-3. **PG password changes on cluster recreation**: If you ever delete and recreate the PG Cluster CR, CloudNativePG generates a new password. You must update the `DATABASE_URL` in the cluster secret.
-
-4. **CNPG bootstrap image upgrade loop**: If the CNPG operator auto-upgrades, it tries to update the bootstrap container image in existing PG pods, causing endless restarts. Fix: delete the Cluster CR and PVCs, let ArgoCD recreate them fresh. Pin the operator chart version to prevent recurrence.
-
-5. **Stuck PVCs during cleanup**: PVCs from deleted CNPG clusters can get stuck in `Terminating`. Fix with: `kubectl patch pvc <name> -n <ns> -p '{"metadata":{"finalizers":null}}' --type=merge`
+```bash
+kubectl get pods -n staging       # All 5 pods Running 1/1
+kubectl get pods -n production    # All 5 pods Running 1/1
+curl -s http://staging.notafilia.es/up   # Should return "OK"
+```
 
 ---
 
-## Phase 5: DNS
+## 6. Phase 5: TLS/HTTPS
 
-### 5.1 Get the Traefik external IP
+### 6.1 How it works
+
+cert-manager watches the `Certificate` resource, contacts Let's Encrypt, performs HTTP-01 challenges via Gateway API HTTPRoutes, and stores the certificate as a Kubernetes Secret. Traefik references this Secret in its Gateway listener.
+
+### 6.2 Configuration
+
+The following files handle TLS (already in the repo):
+
+- `infrastructure/cert-manager/application.yaml` — cert-manager with Gateway API enabled (`featureGates: ExperimentalGatewayAPISupport=true` + `extraArgs: [--enable-gateway-api]`)
+- `infrastructure/cert-manager/cluster-issuer.yaml` — Let's Encrypt ACME issuer using Gateway API HTTP-01 solver
+- `infrastructure/cert-manager/certificate.yaml` — Certificate resource for both `notafilia.es` and `staging.notafilia.es`
+
+### 6.3 Gotcha: cert-manager needs restart after config change
+
+After enabling Gateway API support, cert-manager pods must be restarted:
+
+```bash
+kubectl rollout restart deployment cert-manager -n cert-manager
+```
+
+Then delete and recreate any stuck challenges:
+
+```bash
+kubectl delete challenges --all -n traefik
+kubectl delete certificate notafilia-tls -n traefik
+# ArgoCD recreates the Certificate automatically
+```
+
+### 6.4 Verify
+
+```bash
+kubectl get certificate -n traefik
+# READY should be True
+
+curl -sk https://staging.notafilia.es/up
+# Should return "OK"
+```
+
+---
+
+## 7. Phase 6: CI/CD
+
+### 7.1 GitHub Actions workflow
+
+File: `notafilia/.github/workflows/build-and-push.yml` (in the **app** repo, not infra)
+
+On every push to `main`:
+1. Builds `linux/amd64` Docker image from `Dockerfile.web`
+2. Pushes to GHCR with tags: `${{ github.sha }}` + `staging-latest`
+3. Uses GitHub Actions cache for fast builds
+
+### 7.2 GHCR package permissions
+
+The workflow uses `${{ secrets.GITHUB_TOKEN }}` (automatic OIDC). But the GHCR package must have the repo linked:
+
+**https://github.com/users/RafaFuentes4/packages/container/notafilia/settings**
+→ Manage Actions access → Add `notafilia` repo with **Write** role
+
+### 7.3 Production promotion
+
+Production uses pinned tags (e.g., `v1.0.0`). To promote:
+
+```bash
+# Tag the staging image
+docker pull ghcr.io/rafafuentes4/notafilia:staging-latest
+docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:v1.1.0
+docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
+
+# Update production overlay
+cd notafilia-infra/overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
+git commit -am "Promote v1.1.0 to production" && git push
+```
+
+---
+
+## 8. Phase 7: DNS
+
+### 8.1 Get Traefik external IP
 
 ```bash
 kubectl get svc -n traefik
-# EXTERNAL-IP column shows the LoadBalancer IP (e.g., 57.128.58.136)
+# EXTERNAL-IP: 57.128.58.136
 ```
 
-### 5.2 Configure DNS records
+### 8.2 Add DNS records
 
-In your domain registrar (GoDaddy, Cloudflare, etc.), add two A records:
+In your domain registrar:
 
 | Type | Name | Value | TTL |
 |------|------|-------|-----|
 | A | `@` | `57.128.58.136` | 600 |
 | A | `staging` | `57.128.58.136` | 600 |
 
-### 5.3 Verify
+### 8.3 Verify
 
 ```bash
-# Wait for DNS propagation (usually <10 minutes with 600s TTL)
-dig +short notafilia.es
-dig +short staging.notafilia.es
+dig +short notafilia.es           # Should return the IP
+dig +short staging.notafilia.es   # Should return the IP
+curl -s https://staging.notafilia.es/up   # HTTP 200 OK
+curl -s https://notafilia.es/up           # HTTP 200 OK
+```
 
-# Test the app
-curl -s -o /dev/null -w "HTTP %{http_code}\n" http://staging.notafilia.es/up
-# Should return: HTTP 200
+### 8.4 Important: Restart web pods after DNS/domain changes
+
+If you change `ALLOWED_HOSTS` in the ConfigMap, pods must be restarted to pick up the new value:
+
+```bash
+kubectl rollout restart deployment notafilia-web -n staging
+kubectl rollout restart deployment notafilia-web -n production
 ```
 
 ---
 
-## Current State (as of 2026-03-19)
+## 9. Post-Deployment Tasks
 
-### What's working
-- **Both staging and production** return HTTP 200
-- **All 7 ArgoCD Applications** are Synced
-- **6 of 7** are Healthy (Traefik shows Degraded until TLS is configured)
-- **PostgreSQL** healthy in both namespaces (CloudNativePG operator)
-- **Redis** running in both namespaces (official image)
-- **Traefik** routing via Gateway API with external IP `57.128.58.136`
-- **DNS** configured: `notafilia.es` and `staging.notafilia.es`
-- **Docker images** on GHCR: `staging-latest` and `v1.0.0`
+### 9.1 Create a superuser
 
-### What's not yet done
-- **TLS/HTTPS**: cert-manager and ClusterIssuer are deployed but no Certificate resource is created yet. The app works on HTTP only.
-- **SOPS in ArgoCD**: Secrets are managed manually via `kubectl apply`. KSOPS plugin needs to be configured for full GitOps secret management.
-- **CI/CD**: No GitHub Actions workflow yet. Images are built and pushed manually.
-- **Static files**: CSS/JS aren't loading because S3 media storage isn't configured with real AWS credentials.
-- **Monitoring**: No Prometheus/Grafana. Only Sentry (if DSN is configured in secrets).
+First sign up via the web UI, then promote:
+
+```bash
+# Staging
+kubectl exec -n staging deployment/notafilia-web -c web -- \
+  python manage.py promote_user_to_superuser rafafcantero@gmail.com
+
+# Production
+kubectl exec -n production deployment/notafilia-web -c web -- \
+  python manage.py promote_user_to_superuser rafafcantero@gmail.com
+```
+
+Admin panel: `https://staging.notafilia.es/admin/`
+
+### 9.2 Run any management command
+
+```bash
+kubectl exec -n staging deployment/notafilia-web -c web -- \
+  python manage.py <command> [args]
+```
+
+### 9.3 View logs
+
+```bash
+# Web (Gunicorn)
+kubectl logs -n staging -l app.kubernetes.io/component=web -c web --tail=50
+
+# Migrations (init container)
+kubectl logs -n staging -l app.kubernetes.io/component=web -c migrate --tail=50
+
+# Celery worker
+kubectl logs -n staging -l app.kubernetes.io/component=celery --tail=50
+
+# Celery beat
+kubectl logs -n staging -l app.kubernetes.io/component=beat --tail=50
+
+# PostgreSQL
+kubectl logs -n staging notafilia-pg-1 --tail=50
+```
+
+---
+
+## 10. Final Architecture
 
 ### Cluster topology
 
 ```
-OVH Managed K8s (GRA9, 2× B3-8 nodes)
+OVH Managed K8s (GRA9, K8s 1.34.2)
+├── 2× B3-8 nodes (8GB RAM, 2 vCPU each)
+│
 ├── argocd namespace (7 pods)
-│   └── ArgoCD server, repo-server, app controller, redis, dex, notifications, applicationset
+│   └── server, repo-server, app-controller, redis, dex, notifications, applicationset
+│
 ├── cert-manager namespace (3 pods)
-│   └── controller, cainjector, webhook
+│   └── controller (Gateway API enabled), cainjector, webhook
+│
 ├── cnpg-system namespace (1 pod)
-│   └── CloudNativePG operator
+│   └── CloudNativePG operator (pinned 0.25.0)
+│
 ├── traefik namespace (1 pod)
 │   └── Traefik proxy (LoadBalancer: 57.128.58.136)
+│   └── TLS cert: notafilia-tls (Let's Encrypt, auto-renewed)
+│
 ├── staging namespace (5 pods)
-│   ├── notafilia-web (Gunicorn, 1 replica)
+│   ├── notafilia-web (Gunicorn, 1 replica, init: migrate)
 │   ├── notafilia-celery (worker, 1 replica)
-│   ├── notafilia-beat (scheduler, 1 replica)
-│   ├── notafilia-pg-1 (PostgreSQL 18, 10Gi)
-│   └── redis (7-alpine, 2Gi)
+│   ├── notafilia-beat (scheduler, 1 replica, Recreate)
+│   ├── notafilia-pg-1 (PostgreSQL 18, 10Gi, CloudNativePG)
+│   └── redis (7-alpine, 2Gi PVC)
+│
 └── production namespace (5 pods)
-    ├── notafilia-web (Gunicorn, 1 replica)
+    ├── notafilia-web (Gunicorn, 1 replica, init: migrate)
     ├── notafilia-celery (worker, 1 replica)
-    ├── notafilia-beat (scheduler, 1 replica)
-    ├── notafilia-pg-1 (PostgreSQL 18, 20Gi)
-    └── redis (7-alpine, 2Gi)
+    ├── notafilia-beat (scheduler, 1 replica, Recreate)
+    ├── notafilia-pg-1 (PostgreSQL 18, 20Gi, CloudNativePG)
+    └── redis (7-alpine, 2Gi PVC)
+```
+
+### ArgoCD Applications (all Synced + Healthy)
+
+| Application | Source | What it deploys |
+|-------------|--------|-----------------|
+| notafilia-root | `argocd/` | All other Applications |
+| notafilia-infrastructure | `infrastructure/` (recursive) | Traefik, cert-manager, CNPG, Redis, PG clusters |
+| cert-manager | Helm: charts.jetstack.io | cert-manager controller + CRDs |
+| cloudnative-pg-operator | Helm: cloudnative-pg.github.io | CNPG operator + CRDs |
+| traefik | Helm: traefik.github.io | Traefik proxy + Gateway |
+| notafilia-staging | `overlays/staging` | App deployments in staging |
+| notafilia-production | `overlays/production` | App deployments in production |
+
+### Networking flow
+
+```
+Internet → DNS (notafilia.es / staging.notafilia.es)
+  → OVH LoadBalancer (57.128.58.136:443)
+    → Traefik pod (TLS termination via cert-manager cert)
+      → Gateway API HTTPRoute (host-based routing)
+        → notafilia-web Service (ClusterIP:8000)
+          → Gunicorn pod
 ```
 
 ### Monthly cost
-- 2× B3-8 nodes: ~68€/month (covered by 200€ OVH free trial credit until ~June 2026)
-- Cluster control plane: Free (OVH Free plan)
+- 2× B3-8 nodes: ~68€/month (covered by 200€ OVH free trial credit)
+- Cluster control plane: Free
 - LoadBalancer: Included
-- Block storage (PVCs): ~5€/month for ~36Gi total
+- Block storage (~36Gi total PVCs): ~5€/month
 
 ---
 
-## Troubleshooting
+## 11. Gotchas & Lessons Learned
 
-### Pods stuck in ImagePullBackOff
-- Check `kubectl describe pod <name> -n <ns>` for the exact error
-- If "403 Forbidden": the GHCR package is private and `ghcr-credentials` imagePullSecret is missing or expired
-- If "not found": the image tag doesn't exist. Check `docker buildx imagetools inspect ghcr.io/<user>/notafilia:<tag>`
+These are the issues we hit during setup, in order. If you're recreating this from scratch using the final manifests, you should avoid most of them — but knowing about them helps if something goes wrong.
 
-### Pods stuck in Init:CrashLoopBackOff (web)
-- The `migrate` init container can't connect to PostgreSQL
-- Check PG cluster status: `kubectl get clusters.postgresql.cnpg.io -A`
-- Check PG pod: `kubectl get pods -n <ns> -l cnpg.io/cluster=notafilia-pg`
-- Check secret has correct password: `kubectl get secret notafilia-secrets -n <ns> -o jsonpath='{.data.DATABASE_URL}' | base64 -d`
+### Build & Deploy
 
-### PostgreSQL cluster in restart loop
-- Check if CNPG operator upgraded: `kubectl logs -n cnpg-system -l app.kubernetes.io/name=cloudnative-pg --tail=20`
-- Look for "old bootstrap container image" messages
-- Fix: delete the Cluster CR and PVCs, let ArgoCD recreate. Pin operator chart version.
+1. **Always build for `linux/amd64`**: Use `docker buildx build --platform linux/amd64`. Without this, ARM images cause `exec format error` on x86 nodes.
 
-### 503 Service Unavailable from Traefik
-- Web pods aren't Ready: `kubectl get pods -n <ns> -l app.kubernetes.io/component=web`
-- Check readiness probe: must use `/up` not `/health/` (Django ALLOWED_HOSTS blocks pod IPs)
-- Check HTTPRoute status: `kubectl describe httproute notafilia -n <ns>` — look for `NotAllowedByListeners` (fix: Gateway needs `namespacePolicy: All`)
+2. **GHCR packages are private by default**: Pods get `ImagePullBackOff` with 403. Fix: create `ghcr-credentials` imagePullSecret in each namespace AND link the package to the repo in GHCR settings.
 
-### ArgoCD Application shows "Unknown"
-- The source can't be read. Check `argocd app get <name> --grpc-web` for `ComparisonError`
-- Common cause: referencing a plugin that doesn't exist (e.g., `kustomize-sops`)
+3. **GHCR Actions permissions**: The CI/CD workflow's `${{ secrets.GITHUB_TOKEN }}` gets 403 unless you add the repo to the package's "Manage Actions access" with Write role.
 
-### Insufficient CPU scheduling failures
-- `kubectl describe pod <name>` shows `0/N nodes are available: Insufficient cpu`
-- Either add more nodes or reduce resource requests in deployments
-- Current requests are minimal (25m-50m CPU per pod)
+### Kubernetes & Kustomize
 
-### Stuck PVCs in Terminating state
+4. **Use `labels` not `commonLabels`** in kustomization.yaml — `commonLabels` is deprecated.
+
+5. **Health probes must use `/up`** (not `/health/`): Django's `ALLOWED_HOSTS` blocks requests to pod IPs. The `/up` middleware-based endpoint bypasses this.
+
+6. **`ALLOWED_HOSTS` changes require pod restart**: ConfigMap changes don't auto-restart pods. Run `kubectl rollout restart deployment notafilia-web`.
+
+7. **2 nodes minimum for B3-8**: A single node can't fit all infrastructure + app pods. CPU scheduling fails.
+
+### ArgoCD
+
+8. **CRD ordering with sync-waves**: Resources like PG Clusters and ClusterIssuers need `sync-wave: "1"` annotations. Their operators (wave 0) must install first. Also use `SkipDryRunOnMissingResource=true` on the infrastructure Application.
+
+9. **Don't combine `ServerSideApply` with `--force` in retry loops**: They conflict. Use `SkipDryRunOnMissingResource` alone on the infrastructure Application.
+
+10. **Secrets managed outside Kustomize get pruned**: If a Secret isn't in Kustomize resources but ArgoCD manages the namespace, it gets deleted on sync. Fix: annotate with `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
+
+### Infrastructure
+
+11. **Bitnami images are gone**: Broadcom ended free distribution (Sep 2025). Use official images with plain K8s manifests instead of Bitnami Helm charts.
+
+12. **Traefik chart v34 schema**: `gateway.listeners` is a map (`web: {port: 8000}`), not an array. Ports are Traefik internal (8000/8443), not external (80/443).
+
+13. **Gateway `namespacePolicy: All`**: Without this, HTTPRoutes in staging/production can't reference the Gateway in the traefik namespace. Error: `NotAllowedByListeners`.
+
+14. **Pin CNPG operator chart version**: Wildcard `0.*` causes auto-upgrades that trigger endless PG pod restart loops (bootstrap image version mismatch). Pin to `0.25.0`.
+
+15. **PG password changes on cluster recreation**: If you delete and recreate a PG Cluster CR, CloudNativePG generates new passwords. You must update `DATABASE_URL` in the app secrets.
+
+16. **Stuck PVCs**: After deleting PG clusters, PVCs can get stuck in `Terminating`. Fix: `kubectl patch pvc <name> -n <ns> -p '{"metadata":{"finalizers":null}}' --type=merge`
+
+### TLS
+
+17. **cert-manager Gateway API needs both settings**: `featureGates: ExperimentalGatewayAPISupport=true` AND `extraArgs: [--enable-gateway-api]` in the Helm values. Also needs a pod restart after changing.
+
+18. **Delete challenges after config change**: Old challenges don't retry with the new config. Delete them and let cert-manager recreate.
+
+---
+
+## 12. Troubleshooting
+
+### Pods in ImagePullBackOff
 ```bash
-kubectl patch pvc <name> -n <ns> -p '{"metadata":{"finalizers":null}}' --type=merge
+kubectl describe pod <name> -n <ns>
+```
+- **403 Forbidden**: GHCR package is private. Check `ghcr-credentials` secret exists and GHCR package permissions.
+- **Not found**: Image tag doesn't exist. Verify with `docker buildx imagetools inspect ghcr.io/<user>/notafilia:<tag>`.
+
+### Web pods in Init:CrashLoopBackOff
+The `migrate` init container can't connect to PostgreSQL.
+```bash
+kubectl get clusters.postgresql.cnpg.io -A           # Check PG health
+kubectl logs -n <ns> <web-pod> -c migrate --tail=20   # Check error
+```
+Common causes: PG not ready yet (wait), wrong password in secret (update `DATABASE_URL`).
+
+### PostgreSQL in restart loop
+```bash
+kubectl logs -n cnpg-system -l app.kubernetes.io/name=cloudnative-pg --tail=30 | grep -i restart
+```
+If "old bootstrap container image" appears: delete the Cluster CR and PVCs, let ArgoCD recreate. Pin the operator version.
+
+### 503 from Traefik
+```bash
+kubectl get pods -n <ns> -l app.kubernetes.io/component=web   # Are pods Ready?
+kubectl describe httproute notafilia -n <ns>                   # Check route status
+```
+- Pods not Ready → check init container / readiness probe
+- `NotAllowedByListeners` → Gateway needs `namespacePolicy: All`
+
+### Certificate not issuing
+```bash
+kubectl get certificate -n traefik
+kubectl get challenges -A
+kubectl describe challenge -n traefik <name>
+```
+- `gateway api is not enabled` → restart cert-manager after adding `--enable-gateway-api`
+- Challenges still pending → delete challenges and certificate, let ArgoCD recreate
+
+### Insufficient CPU
+```bash
+kubectl describe pod <name> -n <ns> | grep "Insufficient cpu"
+```
+Add more nodes in OVH console (Node pools tab → increase count).
+
+---
+
+## 13. Common Operations
+
+### Deploy a new app version to staging
+
+Push to `main` → GitHub Actions builds and pushes `staging-latest` → `kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging`
+
+### Promote staging to production
+
+```bash
+docker pull ghcr.io/rafafuentes4/notafilia:<sha-from-staging>
+docker tag ghcr.io/rafafuentes4/notafilia:<sha> ghcr.io/rafafuentes4/notafilia:v1.1.0
+docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
+
+# Update production kustomization
+cd notafilia-infra/overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
+git commit -am "Promote v1.1.0 to production" && git push
+```
+
+### Access ArgoCD UI
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+# Open https://localhost:8080
+```
+
+### Connect to PostgreSQL
+
+```bash
+# Get password
+kubectl get secret notafilia-pg-app -n staging -o jsonpath='{.data.password}' | base64 -d
+
+# Port-forward
+kubectl port-forward -n staging svc/notafilia-pg-rw 5433:5432
+
+# Connect (in another terminal)
+psql -h 127.0.0.1 -p 5433 -U notafilia -d notafilia
+```
+
+### Run Django management commands
+
+```bash
+kubectl exec -n staging deployment/notafilia-web -c web -- python manage.py <command>
+```
+
+### View all ArgoCD app statuses
+
+```bash
+kubectl get applications -n argocd -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+```
+
+### Check cluster resource usage
+
+```bash
+kubectl top nodes
+kubectl top pods -n staging
 ```
