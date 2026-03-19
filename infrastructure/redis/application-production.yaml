@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: redis-staging
+  name: redis-production
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -31,7 +31,7 @@ spec:
               memory: 128Mi
   destination:
     server: https://kubernetes.default.svc
-    namespace: staging
+    namespace: production
   syncPolicy:
     automated:
       prune: true
