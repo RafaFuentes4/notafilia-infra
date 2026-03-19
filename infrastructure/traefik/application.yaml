@@ -24,11 +24,11 @@ spec:
             web:
               port: 8000
               protocol: HTTP
-              namespacePolicy:
+              namespacePolicy: All
             websecure:
               port: 8443
               protocol: HTTPS
-              namespacePolicy:
+              namespacePolicy: All
               # TLS certificate managed by cert-manager
               certificateRefs:
                 - name: notafilia-tls
