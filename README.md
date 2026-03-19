@@ -2,20 +2,22 @@
 
 Kubernetes infrastructure for [Notafilia](https://github.com/RafaFuentes4/notafilia) — a Django application deployed to OVH Managed Kubernetes using a modern GitOps stack.
 
+**Live**: [https://notafilia.es](https://notafilia.es) | [https://staging.notafilia.es](https://staging.notafilia.es)
+
 ## Stack
 
 | Layer | Tool |
 |-------|------|
 | GitOps | ArgoCD |
-| App manifests | Kustomize |
-| Infrastructure charts | Helm |
+| App manifests | Kustomize (plain YAML + overlays) |
+| Infrastructure | Helm (third-party charts only) |
 | Ingress | Traefik + Gateway API |
 | TLS | cert-manager + Let's Encrypt |
 | Secrets | SOPS + age |
-| PostgreSQL | CloudNativePG |
-| Redis | Bitnami Helm chart |
-| CI/CD | GitHub Actions + GHCR |
-| Cluster | OVH Managed Kubernetes |
+| PostgreSQL | CloudNativePG operator |
+| Redis | Official redis:7-alpine |
+| CI/CD | GitHub Actions → GHCR |
+| Cluster | OVH Managed Kubernetes (GRA9, 2× B3-8) |
 
 ## Repository Structure
 
@@ -23,103 +25,92 @@ Kubernetes infrastructure for [Notafilia](https://github.com/RafaFuentes4/notafi
 notafilia-infra/
 ├── base/                          # Kustomize base (app manifests)
 │   ├── kustomization.yaml
-│   ├── deployment-web.yaml
-│   ├── deployment-celery.yaml
-│   ├── deployment-beat.yaml
-│   ├── service-web.yaml
-│   ├── configmap.yaml
-│   └── httproute.yaml
+│   ├── deployment-web.yaml        # Gunicorn + migrate init container
+│   ├── deployment-celery.yaml     # Celery worker
+│   ├── deployment-beat.yaml       # Celery beat (Recreate strategy)
+│   ├── service-web.yaml           # ClusterIP:8000
+│   ├── configmap.yaml             # Non-secret env vars
+│   └── httproute.yaml             # Gateway API route
 ├── overlays/
-│   ├── staging/
-│   │   ├── kustomization.yaml
-│   │   └── secrets.enc.yaml      # SOPS-encrypted
-│   └── production/
-│       ├── kustomization.yaml
-│       └── secrets.enc.yaml
+│   ├── staging/                   # namespace: staging, host: staging.notafilia.es
+│   └── production/                # namespace: production, host: notafilia.es
 ├── infrastructure/                # Third-party services (ArgoCD Applications)
-│   ├── traefik/
-│   ├── cert-manager/
-│   ├── cloudnative-pg/
-│   └── redis/
+│   ├── traefik/                   # Traefik v3 + Gateway API + LoadBalancer
+│   ├── cert-manager/              # cert-manager + ClusterIssuer + Certificate
+│   ├── cloudnative-pg/            # CNPG operator + PG clusters per environment
+│   └── redis/                     # redis:7-alpine per environment
 ├── argocd/                        # App-of-apps bootstrap
-│   ├── app-of-apps.yaml
-│   ├── infrastructure.yaml
-│   ├── staging.yaml
-│   └── production.yaml
-├── docs/
-│   ├── implementation-spec.md     # Full spec with file contents and commands
-│   └── learning-guide.md          # Per-phase learning objectives and links
-├── .sops.yaml
-└── README.md
+│   ├── app-of-apps.yaml           # Root Application → manages everything
+│   ├── infrastructure.yaml        # Deploys all infra services
+│   ├── staging.yaml               # Deploys app to staging
+│   └── production.yaml            # Deploys app to production
+├── .sops.yaml                     # SOPS age encryption config
+└── docs/
+    ├── progress.md                # Complete setup guide (recreate from scratch)
+    ├── learning-guide.md          # K8s concepts explained for junior engineers
+    └── implementation-spec.md     # Original spec (historical reference)
 ```
-
-## Implementation Phases
-
-| Phase | What | Depends on |
-|-------|------|------------|
-| 1. Repo + Tooling | Create all manifests, verify locally | Nothing |
-| 2. OVH Cluster | Provision cluster, install CLI tools | Phase 1 |
-| 3. ArgoCD + Infra | Install ArgoCD, deploy Traefik/cert-manager/CNPG/Redis | Phase 2 |
-| 4. App Deploy | Encrypt secrets, deploy staging | Phase 3 |
-| 5. CI/CD | GitHub Actions workflow for automated builds | Phase 4 |
-| 6. Production | Production secrets, DNS, TLS | Phase 5 |
 
 ## Quick Start
 
-### Prerequisites
-
 ```bash
+# Prerequisites
 brew install kubectl argocd helm sops age kustomize
-```
 
-### Validate manifests locally
-
-```bash
+# Validate manifests locally
 kubectl kustomize overlays/staging
 kubectl kustomize overlays/production
-```
 
-### Encrypt secrets
-
-```bash
-# Generate age key (once)
-age-keygen -o ~/.config/sops/age/keys.txt
-
-# Encrypt a secrets file
-sops -e -i overlays/staging/secrets.enc.yaml
-
-# Edit encrypted secrets
-sops overlays/staging/secrets.enc.yaml
-```
-
-### Deploy
-
-```bash
-# 1. Install ArgoCD on your cluster
-kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-# 2. Apply the root app-of-apps (bootstraps everything)
+# Deploy (after cluster is ready + ArgoCD installed)
 kubectl apply -f argocd/app-of-apps.yaml
-
-# 3. Access ArgoCD UI
-kubectl port-forward svc/argocd-server -n argocd 8080:443
-# Open https://localhost:8080
 ```
 
 ## Documentation
 
-- **[Implementation Spec](docs/implementation-spec.md)** — Detailed steps, commands, and complete file contents for every phase.
-- **[Learning Guide](docs/learning-guide.md)** — K8s concepts to study per phase, official doc links, debugging commands, and glossary.
+| Doc | Purpose |
+|-----|---------|
+| **[Setup Guide](docs/progress.md)** | Step-by-step guide to recreate the entire infrastructure from scratch |
+| **[Learning Guide](docs/learning-guide.md)** | K8s concepts explained with real examples from this project |
+| **[Implementation Spec](docs/implementation-spec.md)** | Original planning spec (historical reference) |
 
 ## App Components
 
-The Notafilia app runs as three deployments from a single Docker image (`Dockerfile.web`):
+Three deployments from a single Docker image (`Dockerfile.web`):
 
 | Component | Command | Replicas |
 |-----------|---------|----------|
-| **web** | `gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 8 --timeout 0 notafilia.wsgi:application` | 1 (staging) / 2 (prod) |
+| **web** | `gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 8 --timeout 0 notafilia.wsgi:application` | 1 |
 | **celery** | `celery -A notafilia worker -l INFO --pool threads --concurrency 20` | 1 |
-| **beat** | `celery -A notafilia beat -l INFO` | 1 (always) |
+| **beat** | `celery -A notafilia beat -l INFO` | 1 (always, Recreate strategy) |
 
 Migrations run as an init container on the web deployment.
+
+## Architecture
+
+```
+Internet → DNS (notafilia.es / staging.notafilia.es)
+  → OVH LoadBalancer (57.128.58.136:443)
+    → Traefik (TLS termination via Let's Encrypt cert)
+      → Gateway API HTTPRoute (host-based routing)
+        → notafilia-web Service → Gunicorn pods
+```
+
+## Common Operations
+
+```bash
+# Access ArgoCD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+
+# View logs
+kubectl logs -n staging -l app.kubernetes.io/component=web -c web --tail=50
+
+# Run Django management commands
+kubectl exec -n staging deployment/notafilia-web -c web -- python manage.py <command>
+
+# Connect to PostgreSQL
+kubectl port-forward -n staging svc/notafilia-pg-rw 5433:5432
+psql -h 127.0.0.1 -p 5433 -U notafilia -d notafilia
+
+# Check all ArgoCD app statuses
+kubectl get applications -n argocd
+```

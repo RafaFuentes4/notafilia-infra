@@ -1,8 +1,10 @@
-# Notafilia K8s Infrastructure — Implementation Specification
+# Notafilia K8s Infrastructure — Implementation Specification (Historical)
+
+> **Note**: This was the original planning document written *before* implementation. The actual setup diverged in several ways (Bitnami → official Redis, `.com` → `.es`, health probes, resource sizing, cert-manager config, etc.). For the authoritative guide that reflects what was actually built, see **[progress.md](progress.md)**. For learning K8s concepts, see **[learning-guide.md](learning-guide.md)**.
 
 ## Overview
 
-This document is the step-by-step implementation spec for deploying Notafilia (a Django app with Celery workers, PostgreSQL, and Redis) to Kubernetes on OVH, using a modern 2026 GitOps stack.
+This document was the step-by-step implementation spec for deploying Notafilia (a Django app with Celery workers, PostgreSQL, and Redis) to Kubernetes on OVH, using a modern 2026 GitOps stack.
 
 ### Technology Stack
 
@@ -15,7 +17,7 @@ This document is the step-by-step implementation spec for deploying Notafilia (a
 | TLS | **cert-manager** | Undisputed standard. CNCF project, works with Gateway API. |
 | Secrets | **SOPS + age** | Value-level encryption, readable diffs, no in-cluster controller needed. |
 | PostgreSQL | **CloudNativePG** | Purpose-built operator. Automated failover, backup/restore to S3, declarative. |
-| Redis | **Bitnami Helm chart** | Simple, well-maintained. Fine for small/medium projects. |
+| Redis | **Official redis:7-alpine** | Bitnami ended free images Sep 2025. Plain manifests with official image. |
 | CI/CD | **GitHub Actions → GHCR** | Native integration, OIDC auth, free for public repos. |
 | Cluster | **OVH Managed K8s** | Single cluster, namespace isolation (staging + production). |
 

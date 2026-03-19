@@ -1,482 +1,651 @@
 # Notafilia K8s Infrastructure — Learning Guide
 
-## How to Use This Guide
-
-Each phase has a **"Learn Before"** section (concepts you should understand before starting) and a **"Learn During"** section (things that will click once you're doing the work). Links point to official documentation — these are the authoritative sources.
-
-The goal is not to memorize everything upfront. Skim the "Learn Before" topics, start the phase, and refer back when you get stuck.
+This guide explains every Kubernetes concept used in this project, with real examples from our actual deployment. It's written for a developer who knows Django but is new to Kubernetes.
 
 ---
 
-## Phase 1: Repository + Local Tooling
+## The Big Picture
 
-### Learn Before
+### What problem does Kubernetes solve?
 
-#### Kubernetes Resource Model
-Everything in K8s is a **resource** described by a YAML manifest. Every resource has `apiVersion`, `kind`, `metadata`, and `spec`. Understanding this pattern unlocks everything else.
+Without K8s, you deploy by SSH-ing into a server, pulling your Docker image, and running it. If the server dies, your app is down. If you need more capacity, you manually spin up another server.
 
-- Read: [Understanding Kubernetes Objects](https://kubernetes.io/docs/concepts/overview/working-with-objects/)
-- Read: [Kubernetes API Conventions](https://kubernetes.io/docs/reference/using-api/api-concepts/) (first 3 sections)
+Kubernetes automates all of this: you describe *what you want* (3 copies of my app, a database, a load balancer) and K8s makes it happen. If a server dies, K8s moves your app to another server. If you need more capacity, you change a number in a YAML file.
 
-Key concepts:
-- **Namespace** — A virtual cluster within a cluster. Resources in different namespaces are isolated. You'll use `staging` and `production` namespaces.
-- **Labels and Selectors** — How K8s resources find each other. A Service finds its Pods via label selectors. A Deployment manages Pods via label selectors.
-- **Declarative vs Imperative** — K8s is declarative: you describe the desired state, and K8s makes it happen. You never say "start 3 pods" — you say "I want 3 replicas" and K8s creates/destroys pods to match.
+### What we built
 
-#### Kustomize
-Kustomize lets you customize YAML without templates. You write plain K8s manifests (the "base"), then create "overlays" that patch specific values per environment.
-
-- Read: [Kustomize Official Docs](https://kustomize.io/)
-- Read: [Kustomize Built-in Transformers](https://kubectl.docs.kubernetes.io/references/kustomize/builtins/)
-- Hands-on: [Kustomize Tutorial](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/)
-
-Key concepts:
-- **Base** — The default manifests. Contains everything the app needs, with placeholder values.
-- **Overlay** — A directory that patches the base for a specific environment. Uses JSON patches or strategic merge patches.
-- **`kustomization.yaml`** — The manifest that ties everything together. Lists resources, patches, and transformations.
-- **`images` transformer** — Override image tags without editing the original YAML. This is how CI/CD updates the deployed version.
-
-**Why Kustomize instead of Helm for your app:** Helm uses Go templates (`{{ .Values.something }}`), which mix templating logic with YAML in ways that are hard to read and debug. Kustomize keeps your manifests as valid YAML at all times — you can `kubectl apply` the base directly. For your own app, this clarity is worth it. Helm is still the right choice for third-party charts where the community maintains the templates.
-
-#### Gateway API (Conceptual)
-Gateway API is the next-generation routing API for Kubernetes, replacing the Ingress API.
-
-- Read: [Gateway API Introduction](https://gateway-api.sigs.k8s.io/)
-- Read: [Getting Started with Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
-
-Key concepts:
-- **GatewayClass** — Defines the controller (Traefik, in our case). Like a "driver" for the gateway.
-- **Gateway** — The actual listener. Binds to ports (80, 443) and defines TLS configuration.
-- **HTTPRoute** — Routes traffic from the Gateway to your Services based on hostname, path, headers, etc.
-
-The mental model: `GatewayClass` (who handles traffic) → `Gateway` (where to listen) → `HTTPRoute` (where to send it).
-
-### Learn During
-
-- How `kubectl kustomize <dir>` renders the final YAML — run it often to see what your changes produce.
-- How JSON patches work (`op: replace`, `path: /spec/...`) — you'll write these in overlays.
-- How ArgoCD Application manifests describe "what to deploy where" — they're just YAML resources themselves.
-
-### Production-Readiness at This Phase
-You're not on a cluster yet, so "production-ready" means: all manifests render valid YAML, the repo structure is clean, and you understand every line you wrote.
-
----
-
-## Phase 2: OVH Cluster Setup
-
-### Learn Before
-
-#### How Managed Kubernetes Works
-OVH (and AWS EKS, GCP GKE, Azure AKS) provides the **control plane** (API server, etcd, scheduler, controller manager). You only manage **worker nodes** — the VMs that run your containers.
-
-- Read: [Kubernetes Components](https://kubernetes.io/docs/concepts/overview/components/)
-- Read: [OVH Managed Kubernetes Documentation](https://help.ovhcloud.com/csm/en-public-cloud-kubernetes-overview)
-
-Key concepts:
-- **Control plane** — The brain. Managed by OVH. You interact with it via `kubectl` and the API server.
-- **Worker nodes** — The muscle. VMs where your Pods actually run. You choose the size and count.
-- **Node pool** — A group of identically-sized nodes. Start with one pool. You can add more later (e.g., a pool with GPU nodes).
-- **kubeconfig** — The file that tells `kubectl` how to connect to your cluster. Contains the API server URL and authentication credentials.
-
-#### kubectl Basics
-`kubectl` is your primary interface to the cluster. Learn these commands:
-
-- Read: [kubectl Cheat Sheet](https://kubernetes.io/docs/reference/kubectl/cheatsheet/)
-
-Essential commands:
-```bash
-kubectl get <resource>             # List resources
-kubectl describe <resource> <name> # Detailed info
-kubectl logs <pod> [-c container]  # View logs
-kubectl exec -it <pod> -- bash     # Shell into a pod
-kubectl apply -f <file>            # Create/update from YAML
-kubectl delete -f <file>           # Delete from YAML
-kubectl get events --sort-by='.lastTimestamp'  # Recent events
+```
+You push code → GitHub Actions builds a Docker image → pushes to GHCR
+                                                           ↓
+ArgoCD watches the Git repo → detects changes → syncs to the cluster
+                                                           ↓
+OVH Kubernetes runs: Traefik (routing) → Django (web) + Celery + PostgreSQL + Redis
+                                                           ↓
+Users access: https://notafilia.es (production) / https://staging.notafilia.es (staging)
 ```
 
-#### SOPS + age (Encryption)
-SOPS encrypts individual values in YAML files while keeping the structure and keys readable. `age` is the encryption algorithm (simpler than PGP).
+### Our actual cluster
 
-- Read: [SOPS README](https://github.com/getsops/sops)
-- Read: [age README](https://github.com/FiloSottile/age)
-
-Key concepts:
-- **age keypair** — A public key (for encrypting) and private key (for decrypting). The public key goes in `.sops.yaml`. The private key stays on your machine and in the cluster.
-- **`.sops.yaml`** — Config file that tells SOPS which key to use for which files (matched by path regex).
-- **`sops -e -i file.yaml`** — Encrypt a file in-place. Values become `ENC[AES256_GCM,data:...,type:str]`.
-- **`sops -d file.yaml`** — Decrypt and print to stdout.
-- **`sops file.yaml`** — Open in your editor with values decrypted. Saves re-encrypted.
-
-### Learn During
-
-- How kubeconfig contexts work — you can have multiple clusters configured and switch between them with `kubectl config use-context`.
-- The difference between namespaces (`staging` vs `production`) and how they provide isolation.
-- How `age-keygen` works and why you need to back up the private key.
-
-### Production-Readiness at This Phase
-The cluster exists, you can reach it, and namespaces are created. Not much to go wrong here, but verify node health and that you can create resources.
+```
+OVH Managed K8s (Gravelines, France)
+├── 2 nodes (B3-8: 8GB RAM, 2 vCPU each)
+├── 22 pods total across 6 namespaces
+├── External IP: 57.128.58.136
+└── TLS: Let's Encrypt auto-renewed certificates
+```
 
 ---
 
-## Phase 3: ArgoCD + Infrastructure Services
+## Core Concepts (with our examples)
 
-### Learn Before
+### 1. Pods
 
-#### ArgoCD Core Concepts
-ArgoCD is a GitOps controller: it watches a Git repo and ensures the cluster matches what's in Git.
+A Pod is the smallest thing K8s runs. It's one or more containers sharing the same network.
 
-- Read: [ArgoCD Getting Started](https://argo-cd.readthedocs.io/en/stable/getting_started/)
-- Read: [ArgoCD Core Concepts](https://argo-cd.readthedocs.io/en/stable/core_concepts/)
-- Read: [App of Apps Pattern](https://argo-cd.readthedocs.io/en/stable/operator-manual/cluster-bootstrapping/#app-of-apps-pattern)
+**Our example**: `notafilia-web-74cb999499-8nb52` is a Pod. It contains one container running Gunicorn.
 
-Key concepts:
-- **Application** — The fundamental ArgoCD resource. Maps a Git path to a cluster namespace. ArgoCD watches the Git path and syncs changes to the cluster.
-- **Sync** — The process of making the cluster match Git. Can be manual or automatic.
-- **Health** — ArgoCD checks if resources are actually working (not just created). A Deployment is "Healthy" when all replicas are ready.
-- **Sync Status** — `Synced` means cluster matches Git. `OutOfSync` means there's a diff.
-- **App of Apps** — A pattern where one Application manages other Applications. This is how we bootstrap everything from a single `kubectl apply`.
-- **Self-Heal** — When enabled, ArgoCD reverts manual changes made to the cluster (e.g., someone `kubectl edit`s a Deployment).
-- **Prune** — When enabled, ArgoCD deletes resources that were removed from Git.
+```bash
+# See all pods in staging
+kubectl get pods -n staging
 
-**The ArgoCD UI** is your best learning tool. It shows:
-- Resource trees (Deployment → ReplicaSet → Pods)
-- Live diffs between Git and cluster state
-- Event logs
-- Sync history
+# See details about a pod
+kubectl describe pod notafilia-web-74cb999499-8nb52 -n staging
 
-#### Helm (for Third-Party Charts)
-You're using Helm for installing community-maintained charts, not for your own app.
+# View logs from a pod
+kubectl logs notafilia-web-74cb999499-8nb52 -n staging -c web
+```
 
-- Read: [Helm Concepts](https://helm.sh/docs/intro/using_helm/)
-- Read: [Helm Chart Repositories](https://helm.sh/docs/helm/helm_repo/)
+You almost never create Pods directly — you create Deployments (see below) which manage Pods for you.
 
-Key concepts:
-- **Chart** — A package of K8s resources with configurable values.
-- **Repository** — Where charts are hosted (e.g., `https://charts.bitnami.com/bitnami`).
-- **Values** — Configuration overrides. You pass these via `helm install --values` or, in our case, via the ArgoCD Application's `spec.source.helm.values`.
-- **Release** — An instance of a chart installed in the cluster.
+### 2. Deployments
 
-You won't run `helm install` manually — ArgoCD does it for you based on the Application manifests.
+A Deployment tells K8s: "I want N copies of this Pod, and if any die, recreate them."
 
-#### CloudNativePG
-CloudNativePG is a Kubernetes operator that manages PostgreSQL clusters.
+**Our example** (`base/deployment-web.yaml`):
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notafilia-web
+spec:
+  replicas: 1                    # How many copies
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: web   # "Manage pods with this label"
+  template:                      # Pod template
+    spec:
+      initContainers:
+        - name: migrate          # Runs BEFORE the main container
+          command: ["python", "manage.py", "migrate", "--noinput"]
+      containers:
+        - name: web              # The main container
+          image: ghcr.io/rafafuentes4/notafilia:staging-latest
+          command: ["gunicorn", "--bind=0.0.0.0:8000", ...]
+```
 
-- Read: [CloudNativePG Architecture](https://cloudnative-pg.io/documentation/current/architecture/)
-- Read: [CloudNativePG Quickstart](https://cloudnative-pg.io/documentation/current/quickstart/)
+**Key concepts:**
+- `replicas: 1` → K8s always keeps 1 pod running. Kill it, K8s starts another.
+- `initContainers` → Run before the main container. We use this for `manage.py migrate`. If migrations fail, the pod stays in `Init:Error` and Gunicorn never starts (which is what you want).
+- `image` → The Docker image to run. This is overridden per environment by Kustomize overlays.
 
-Key concepts:
-- **Operator pattern** — A controller that watches Custom Resources (CRs) and manages complex software. CloudNativePG watches `Cluster` CRs and manages PostgreSQL pods, PVCs, services, and secrets.
-- **Cluster CR** — Your declaration of what you want: how many instances, storage size, PostgreSQL parameters, backup config.
-- **Primary and Standby** — In HA mode (instances > 1), one pod is primary (read-write) and others are standbys (read-only, can be promoted).
-- **`-rw` Service** — Points to the primary. This is what your `DATABASE_URL` should reference.
-- **`-r` Service** — Points to standbys (for read-only queries).
-- **PVC management** — CloudNativePG manages its own PVCs (does NOT use StatefulSets). This gives it more control over failover and data safety.
+**Our Celery Beat Deployment** has a special `strategy: Recreate`:
+```yaml
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate    # Kill old pod BEFORE starting new one
+```
+Why? Beat schedules tasks. If two Beat instances run simultaneously, you get duplicate tasks. `Recreate` ensures zero overlap during deployments.
 
-#### Traefik
-Traefik is a modern reverse proxy / ingress controller with native Gateway API support.
+### 3. Services
 
-- Read: [Traefik Kubernetes Gateway Provider](https://doc.traefik.io/traefik/providers/kubernetes-gateway/)
-- Read: [Traefik Dashboard](https://doc.traefik.io/traefik/operations/dashboard/)
+Pods get random IP addresses that change when they restart. A Service gives them a stable address.
 
-Key concepts:
-- Traefik runs as a Deployment with a LoadBalancer Service (gets an external IP from OVH).
-- It watches Gateway and HTTPRoute resources and configures routing automatically.
-- The built-in dashboard shows active routes, services, and middlewares — useful for debugging.
+**Our example** (`base/service-web.yaml`):
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: notafilia-web
+spec:
+  type: ClusterIP       # Only accessible inside the cluster
+  ports:
+    - port: 8000
+  selector:
+    app.kubernetes.io/component: web   # "Route to pods with this label"
+```
 
-#### cert-manager
-cert-manager automates TLS certificate management.
+Now anything in the cluster can reach our Django app at `notafilia-web:8000` — regardless of which pod is running or what its IP is.
 
-- Read: [cert-manager Concepts](https://cert-manager.io/docs/concepts/)
-- Read: [cert-manager with Gateway API](https://cert-manager.io/docs/usage/gateway/)
+**Service types we use:**
+- **ClusterIP** (default) — Internal only. Used for web, Redis, PostgreSQL.
+- **LoadBalancer** — Gets a public IP from OVH. Used only for Traefik (`57.128.58.136`).
 
-Key concepts:
-- **Issuer / ClusterIssuer** — Defines where to get certificates from (Let's Encrypt, self-signed, etc.).
-- **Certificate** — A request for a TLS certificate. cert-manager creates the certificate and stores it as a K8s Secret.
-- **ACME** — The protocol Let's Encrypt uses. cert-manager handles the challenge/response automatically.
-- **HTTP-01 challenge** — Proves you own a domain by serving a specific file. cert-manager creates a temporary HTTPRoute for this.
+### 4. Namespaces
 
-### Learn During
+Namespaces are like folders for K8s resources. They provide isolation.
 
-- How to read the ArgoCD UI — spend time clicking through the resource tree, viewing diffs, and understanding sync states.
-- How ArgoCD handles Helm charts — it doesn't run `helm install`, it renders the chart and applies the YAML (like `helm template` + `kubectl apply`).
-- How to debug pods that won't start: `kubectl describe pod`, `kubectl logs`, `kubectl get events`.
-- How OVH provisions LoadBalancer IPs — the Traefik Service gets an external IP from OVH's cloud infrastructure.
+**Our namespaces:**
+| Namespace | What's in it |
+|-----------|-------------|
+| `staging` | Django app + Celery + Beat + PostgreSQL + Redis (staging env) |
+| `production` | Same thing (production env) |
+| `argocd` | ArgoCD itself |
+| `traefik` | Traefik proxy + TLS certificates |
+| `cert-manager` | cert-manager controller |
+| `cnpg-system` | CloudNativePG operator |
 
-### Production-Readiness at This Phase
-All infrastructure services are running and managed by ArgoCD. If someone manually changes something on the cluster, ArgoCD reverts it (self-heal). This is a major improvement over manually-managed infrastructure.
+Staging and production are completely isolated. Different databases, different secrets, different pods. Same manifests, different overlays.
 
-**What "production-ready" means here:**
-- All ArgoCD Applications show Synced + Healthy
-- Traefik has an external IP
-- CloudNativePG cluster is in healthy state
-- cert-manager can issue certificates
-- Redis is accepting connections
+### 5. ConfigMaps and Secrets
 
----
+How you pass configuration to containers — the K8s equivalent of `.env` files.
 
-## Phase 4: App Deployment (Staging)
+**ConfigMap** — Non-sensitive values (`base/configmap.yaml`):
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notafilia-config
+data:
+  DJANGO_SETTINGS_MODULE: "notafilia.settings_production"
+  ALLOWED_HOSTS: "*"           # Overridden per environment
+  USE_S3_MEDIA: "True"
+```
 
-### Learn Before
+**Secret** — Sensitive values (created via `kubectl apply`, not in Git):
+```yaml
+stringData:
+  SECRET_KEY: "l1TrB1Uo3J-..."
+  DATABASE_URL: "postgresql://notafilia:<password>@notafilia-pg-rw.staging:5432/notafilia"
+  REDIS_URL: "redis://redis-master.staging:6379/0"
+```
 
-#### Pods, Deployments, and ReplicaSets
-The core workload resources in Kubernetes.
+**How pods consume them** (in the Deployment):
+```yaml
+envFrom:
+  - configMapRef:
+      name: notafilia-config     # All keys become env vars
+  - secretRef:
+      name: notafilia-secrets    # All keys become env vars
+```
 
-- Read: [Pods](https://kubernetes.io/docs/concepts/workloads/pods/)
-- Read: [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+This means inside the pod, Django sees `os.environ["DATABASE_URL"]` exactly like it would with a `.env` file.
 
-Key concepts:
-- **Pod** — The smallest deployable unit. One or more containers that share networking and storage. You almost never create Pods directly.
-- **ReplicaSet** — Ensures a specified number of Pod replicas are running. Created by Deployments — you don't manage these directly either.
-- **Deployment** — Declares the desired state for a set of Pods. Handles rolling updates, rollbacks, and scaling. This is what you write in your manifests.
-- **Init Containers** — Containers that run before the main container. Used for migrations, waiting for dependencies, etc. If an init container fails, the Pod restarts.
+### 6. Persistent Volumes (PVCs)
 
-#### Services and Networking
-How pods communicate.
+Containers are ephemeral — when a pod dies, its filesystem is gone. PVCs give pods durable storage.
 
-- Read: [Services](https://kubernetes.io/docs/concepts/services-networking/service/)
-- Read: [DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)
+**Our example** (Redis):
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: csi-cinder-high-speed   # OVH's fast SSD storage
+```
 
-Key concepts:
-- **ClusterIP** — Internal-only IP. Other pods reach it via DNS: `<service-name>.<namespace>.svc.cluster.local` or just `<service-name>` within the same namespace.
-- **Service discovery** — Your app reaches PostgreSQL via `notafilia-pg-rw.staging:5432`. K8s DNS resolves this to the service's ClusterIP.
-- **Cross-namespace access** — Use the FQDN: `notafilia-pg-rw.staging.svc.cluster.local`.
+OVH automatically provisions a 2GB SSD volume and attaches it to the pod. If the pod restarts, the data is still there.
 
-#### ConfigMaps and Secrets
-How to pass configuration to containers.
-
-- Read: [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/)
-- Read: [Secrets](https://kubernetes.io/docs/concepts/configuration/secret/)
-
-Key concepts:
-- **ConfigMap** — Non-sensitive key-value pairs. Injected as environment variables via `envFrom`.
-- **Secret** — Sensitive data (base64-encoded in etcd). Same injection mechanism, but with access controls.
-- **`envFrom`** — Injects all key-value pairs from a ConfigMap or Secret as environment variables. Simpler than listing each env var individually.
-
-#### Environment Variables in Django
-How the app consumes configuration.
-
-- The app uses `os.environ.get("DATABASE_URL")` and `dj-database-url` to parse the connection string.
-- `DJANGO_SETTINGS_MODULE` tells Django which settings file to use.
-- The `settings_production.py` module imports `settings.py` and overrides specific values.
-
-### Learn During
-
-- How to debug failed init containers (migrations): `kubectl logs <pod> -c migrate -n staging`
-- How SOPS encryption/decryption works in practice — edit encrypted files with `sops overlays/staging/secrets.enc.yaml`
-- How ArgoCD shows the diff between Git and cluster state when secrets change.
-- How to verify environment variables inside a running pod: `kubectl exec -it <pod> -n staging -- env | grep DATABASE`
-
-### Production-Readiness at This Phase
-The app is running in staging. You can access it via HTTPS. Migrations ran successfully. All 3 components (web, celery, beat) are healthy.
-
-**What to verify:**
-- Can you log in?
-- Do Celery tasks execute?
-- Are scheduled tasks (beat) firing on time?
-- Is the TLS certificate valid?
-- Do health check endpoints respond?
-
----
-
-## Phase 5: CI/CD (GitHub Actions)
-
-### Learn Before
-
-#### GitHub Actions for Docker
-- Read: [GitHub Actions: Publishing Docker images](https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-docker-images)
-- Read: [docker/build-push-action](https://github.com/docker/build-push-action)
-
-Key concepts:
-- **GHCR (GitHub Container Registry)** — Docker registry at `ghcr.io`. Free for public repos, generous limits for private.
-- **OIDC authentication** — `${{ secrets.GITHUB_TOKEN }}` is automatically available in every workflow. No need to store registry credentials as secrets.
-- **Build caching** — `cache-from: type=gha` caches Docker layers in GitHub's cache storage. Subsequent builds only rebuild changed layers.
-
-#### ArgoCD Image Updater (Optional)
-- Read: [ArgoCD Image Updater Docs](https://argocd-image-updater.readthedocs.io/)
-
-Key concepts:
-- Watches container registries for new image tags.
-- Updates the running application in ArgoCD when a new tag matching your pattern appears.
-- Can write back to Git (so the repo stays the source of truth) or update in-memory only.
-
-#### GitOps Image Update Strategies
-There are two approaches to updating images:
-
-1. **Push-based** (simpler): CI pushes a commit to the infra repo updating the image tag. ArgoCD syncs the change.
-2. **Pull-based** (Image Updater): ArgoCD watches the registry and updates automatically.
-
-For learning, push-based is easier to understand. For production, pull-based is more GitOps-pure.
-
-### Learn During
-
-- How GitHub Actions OIDC works for registry authentication.
-- How Docker layer caching dramatically speeds up builds.
-- The full loop: code push → image build → tag update → ArgoCD sync → new pods.
-- How to roll back: just revert the image tag in Git and ArgoCD syncs the old version.
-
-### Production-Readiness at This Phase
-You have automated delivery. Code changes flow through to staging automatically. Production is still manually promoted (deliberate choice for safety).
-
-**What to verify:**
-- Push to main → GitHub Actions builds and pushes an image
-- The image appears in GHCR
-- ArgoCD detects the change and syncs staging
-- The new code is live in staging
+**Our PVCs:**
+- PostgreSQL staging: 10Gi
+- PostgreSQL production: 20Gi
+- Redis staging/production: 2Gi each
 
 ---
 
-## Phase 6: Production
+## How Kustomize Works (with our code)
 
-### Learn Before
+Kustomize is our "template" system, but it doesn't use templates. Instead:
 
-#### Production Concerns
-- Read: [K8s Production Best Practices](https://kubernetes.io/docs/setup/production-environment/)
-- Read: [Pod Disruption Budgets](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+1. **Base** (`base/`) — The full app manifests with generic values
+2. **Overlays** (`overlays/staging/`, `overlays/production/`) — Patches that modify the base
 
-Key concepts:
-- **Pod Disruption Budget (PDB)** — Guarantees minimum availability during voluntary disruptions (node upgrades, scaling). `minAvailable: 1` ensures at least 1 web pod is always running.
-- **Resource requests vs limits** — Requests are guaranteed (the scheduler uses them for placement). Limits are max allowed. Set requests based on actual usage, limits with headroom.
-- **Rolling updates** — Deployments update pods gradually. One new pod comes up, one old pod goes down. Zero downtime if health checks are configured.
+### Base → Overlay → Final YAML
 
-#### DNS and TLS
-- Read: [cert-manager: Securing Gateway Resources](https://cert-manager.io/docs/usage/gateway/)
+**Base** (`base/configmap.yaml`):
+```yaml
+data:
+  ALLOWED_HOSTS: "*"    # Generic placeholder
+```
 
-Key concepts:
-- **A record** — Maps a domain to an IP. Point `notafilia.com` to the Traefik LoadBalancer IP.
-- **Let's Encrypt rate limits** — 50 certificates per registered domain per week. Use the staging issuer (`acme-staging-v02.api.letsencrypt.org`) for testing.
-- **HSTS** — HTTP Strict Transport Security. Once you're confident TLS works, enable it in `settings_production.py`.
+**Staging overlay** (`overlays/staging/kustomization.yaml`):
+```yaml
+patches:
+  - target:
+      kind: ConfigMap
+      name: notafilia-config
+    patch: |-
+      - op: replace
+        path: /data/ALLOWED_HOSTS
+        value: "staging.notafilia.es"   # Staging-specific
+```
 
-#### Monitoring and Observability
-Not in scope for initial deployment, but worth knowing about:
+**Result** (what K8s actually sees):
+```yaml
+data:
+  ALLOWED_HOSTS: "staging.notafilia.es"
+```
 
-- Read: [Kubernetes Monitoring with Prometheus](https://prometheus.io/docs/introduction/overview/)
-- Read: [Sentry for Django](https://docs.sentry.io/platforms/python/integrations/django/) (already in the app)
+### Image tag overrides
 
-The app already has Sentry configured via `SENTRY_DSN`. For K8s-level monitoring, you can add Prometheus + Grafana later (another ArgoCD Application).
+The base uses `ghcr.io/rafafuentes4/notafilia:latest`. The overlay changes the tag:
 
-### Learn During
+```yaml
+images:
+  - name: ghcr.io/rafafuentes4/notafilia
+    newTag: staging-latest    # Or v1.0.0 for production
+```
 
-- How DNS propagation works and why it can take hours.
-- How cert-manager's ACME HTTP-01 challenge works in practice (creates temporary routes).
-- How to monitor production pods: `kubectl top pods`, `kubectl logs --follow`.
-- The difference between staging and production ArgoCD sync policies (prune: false in production).
+Kustomize finds every reference to that image and replaces the tag. No editing deployment files.
 
-### Production-Readiness at This Phase
-This IS production-ready. Specifically:
+### Try it yourself
 
-| Aspect | Status |
-|--------|--------|
-| TLS | cert-manager auto-renews Let's Encrypt certificates |
-| High availability | 2 web replicas with PodDisruptionBudget |
-| Database | CloudNativePG with standby (automated failover) |
-| Secrets | Encrypted at rest (SOPS), decrypted only at sync time |
-| GitOps | All changes through Git, ArgoCD auto-syncs |
-| CI/CD | Automated builds, manual production promotion |
-| Rollback | Revert the image tag in Git |
-| Monitoring | Sentry for app errors, ArgoCD for infrastructure health |
+```bash
+# See what staging actually produces:
+kubectl kustomize overlays/staging/
 
-**What's NOT included (and can be added later):**
-- Database backups to S3 (CloudNativePG supports this natively)
-- Prometheus + Grafana for metrics
-- Horizontal Pod Autoscaler (HPA)
-- Network policies for namespace isolation
-- ArgoCD notifications (Slack/email on sync failures)
+# Compare with production:
+kubectl kustomize overlays/production/
+```
 
 ---
 
-## Recommended Reading Order
+## How ArgoCD Works (GitOps)
 
-### Before Starting Anything
-1. [Understanding Kubernetes Objects](https://kubernetes.io/docs/concepts/overview/working-with-objects/) (15 min)
-2. [Kubernetes Components](https://kubernetes.io/docs/concepts/overview/components/) (10 min)
-3. [Kustomize Tutorial](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/) (20 min)
+### The concept
 
-### Before Phase 2
-4. [kubectl Cheat Sheet](https://kubernetes.io/docs/reference/kubectl/cheatsheet/) (bookmark this)
-5. [SOPS README](https://github.com/getsops/sops) (15 min, focus on age encryption)
+Traditional deployment: you run `kubectl apply` manually. If someone changes something on the cluster directly, your Git repo and the cluster diverge.
 
-### Before Phase 3
-6. [ArgoCD Getting Started](https://argo-cd.readthedocs.io/en/stable/getting_started/) (30 min, follow along)
-7. [App of Apps Pattern](https://argo-cd.readthedocs.io/en/stable/operator-manual/cluster-bootstrapping/#app-of-apps-pattern) (10 min)
-8. [Gateway API Introduction](https://gateway-api.sigs.k8s.io/) (15 min)
-9. [CloudNativePG Quickstart](https://cloudnative-pg.io/documentation/current/quickstart/) (20 min)
+GitOps: the Git repo is the **single source of truth**. ArgoCD watches the repo and continuously makes the cluster match what's in Git. If someone manually edits something on the cluster, ArgoCD reverts it.
 
-### Before Phase 4
-10. [Pods](https://kubernetes.io/docs/concepts/workloads/pods/) (10 min)
-11. [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) (15 min)
-12. [Services](https://kubernetes.io/docs/concepts/services-networking/service/) (10 min)
-13. [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/) (10 min)
+### App-of-apps pattern
 
-### Before Phase 5
-14. [GitHub Actions: Publishing Docker images](https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-docker-images) (15 min)
+We use one root Application that bootstraps everything:
 
-### Before Phase 6
-15. [Pod Disruption Budgets](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/) (10 min)
-16. [cert-manager: Securing Gateway Resources](https://cert-manager.io/docs/usage/gateway/) (15 min)
+```
+notafilia-root (watches argocd/ directory)
+├── notafilia-infrastructure (watches infrastructure/ recursively)
+│   ├── traefik (Helm chart → Traefik pod + LoadBalancer)
+│   ├── cert-manager (Helm chart → cert-manager + CRDs)
+│   ├── cloudnative-pg-operator (Helm chart → CNPG operator)
+│   ├── ClusterIssuer (Let's Encrypt config)
+│   ├── Certificate (TLS cert for our domains)
+│   ├── PG Cluster staging (PostgreSQL instance)
+│   ├── PG Cluster production (PostgreSQL instance)
+│   ├── Redis staging (Deployment + PVC + Service)
+│   └── Redis production (Deployment + PVC + Service)
+├── notafilia-staging (watches overlays/staging → app pods)
+└── notafilia-production (watches overlays/production → app pods)
+```
 
-**Total estimated reading: ~4-5 hours**, spread across the phases. Most of the learning happens by doing.
+**One `kubectl apply` deploys everything.** Push a change to Git and ArgoCD syncs it within 3 minutes.
+
+### Sync waves
+
+Some things must deploy before others. CloudNativePG Clusters need the CNPG operator installed first. We use annotations:
+
+```yaml
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"    # Deploy after wave 0 (default)
+```
+
+Wave 0 (operators) deploys first → Wave 1 (CRD instances) deploys second.
 
 ---
 
-## Quick Reference: Debugging Commands
+## How Gateway API + Traefik Works
 
-These are the commands you'll use most often when things go wrong:
+### The old way: Ingress (deprecated)
+
+```yaml
+# DON'T USE THIS — Ingress API is feature-frozen, ingress-nginx is EOL
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+```
+
+### The new way: Gateway API
+
+Three resources work together:
+
+**GatewayClass** → "Who handles traffic?" (Traefik — configured by the Helm chart)
+
+**Gateway** → "Where to listen?" (ports 80/443, with TLS)
+- Our Gateway is in the `traefik` namespace
+- `namespacePolicy: All` allows routes from other namespaces
+
+**HTTPRoute** → "Where to send traffic?" (`base/httproute.yaml`):
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: notafilia
+spec:
+  parentRefs:
+    - name: traefik-gateway
+      namespace: traefik           # Gateway is in traefik namespace
+  hostnames:
+    - "notafilia.example.com"      # Overridden by overlay to notafilia.es
+  rules:
+    - backendRefs:
+        - name: notafilia-web      # Send to our Service
+          port: 8000
+```
+
+**The full flow:**
+```
+Browser → notafilia.es:443
+  → DNS resolves to 57.128.58.136 (OVH LoadBalancer)
+    → Traefik receives the request
+      → Checks HTTPRoutes: "notafilia.es" matches production route
+        → Forwards to notafilia-web Service in production namespace
+          → Reaches a Gunicorn pod
+```
+
+---
+
+## How TLS/HTTPS Works
+
+### The components
+
+1. **cert-manager** — A K8s operator that automates certificate management
+2. **ClusterIssuer** — Tells cert-manager to use Let's Encrypt
+3. **Certificate** — "I want a cert for notafilia.es and staging.notafilia.es"
+
+### What happens automatically
+
+1. cert-manager sees the Certificate resource
+2. Contacts Let's Encrypt: "I want a cert for notafilia.es"
+3. Let's Encrypt says: "Prove you own that domain. Serve this token at `http://notafilia.es/.well-known/acme-challenge/xxx`"
+4. cert-manager creates a temporary HTTPRoute via Gateway API
+5. Traefik serves the token
+6. Let's Encrypt verifies → issues the certificate
+7. cert-manager stores it as a K8s Secret (`notafilia-tls`) in the `traefik` namespace
+8. Traefik uses this Secret for HTTPS
+9. cert-manager auto-renews before expiry
+
+You never manually create or renew certificates. It's fully automated.
+
+---
+
+## How CloudNativePG Works
+
+### Why not just run PostgreSQL in a regular Deployment?
+
+Databases need special care: persistent storage, backup/restore, failover, connection management. A regular Deployment doesn't handle any of this.
+
+CloudNativePG is an **operator** — a program that understands how to run PostgreSQL properly on Kubernetes.
+
+### What you declare
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster                        # Custom resource (not a standard K8s resource)
+metadata:
+  name: notafilia-pg
+  namespace: staging
+spec:
+  instances: 1                       # Number of PostgreSQL instances
+  bootstrap:
+    initdb:
+      database: notafilia            # Auto-create this database
+      owner: notafilia               # Auto-create this user
+  storage:
+    size: 10Gi
+```
+
+### What the operator creates automatically
+
+From that single YAML, CloudNativePG creates:
+- **Pod** `notafilia-pg-1` running PostgreSQL 18
+- **PVC** `notafilia-pg-1` with 10Gi storage
+- **Service** `notafilia-pg-rw` (read-write endpoint — this is what your `DATABASE_URL` points to)
+- **Service** `notafilia-pg-r` (read replicas, for future use)
+- **Secret** `notafilia-pg-app` (auto-generated username/password)
+
+Your app connects to `postgresql://notafilia:<auto-password>@notafilia-pg-rw.staging:5432/notafilia`. The password is in the auto-generated Secret.
+
+---
+
+## How SOPS + age Works
+
+### The problem
+
+Secrets (database passwords, API keys) need to be in Git for GitOps to work, but you can't store plaintext secrets in Git.
+
+### The solution
+
+**SOPS** encrypts individual values in YAML files. **age** is the encryption algorithm.
+
+```yaml
+# Before encryption:
+stringData:
+  SECRET_KEY: "my-real-secret"
+  DATABASE_URL: "postgresql://..."
+
+# After `sops -e -i secrets.enc.yaml`:
+stringData:
+  SECRET_KEY: ENC[AES256_GCM,data:xxxx,type:str]
+  DATABASE_URL: ENC[AES256_GCM,data:yyyy,type:str]
+```
+
+The keys are readable, only values are encrypted. This means `git diff` shows you *which* secrets changed without revealing the values.
+
+### Key management
+
+```bash
+# Generate a keypair (once)
+age-keygen -o ~/.config/sops/age/keys.txt
+# Public key: age1xxx... (goes in .sops.yaml, safe to commit)
+# Private key: AGE-SECRET-KEY-xxx... (NEVER commit, back up to 1Password)
+```
+
+`.sops.yaml` tells SOPS which key to use for which files:
+```yaml
+creation_rules:
+  - path_regex: overlays/staging/.*\.enc\.yaml$
+    age: age1gg0wxkdew42q0glwhp4efy83cna825stw9l8n6merxr2znm8t4esvak57u
+```
+
+---
+
+## How CI/CD Works
+
+### The pipeline
+
+```
+Developer pushes to main
+  → GitHub Actions triggers
+    → Builds Docker image (linux/amd64) from Dockerfile.web
+      → Pushes to GHCR with tags: {sha} + staging-latest
+        → kubectl rollout restart picks up the new image
+```
+
+**Workflow file** (`.github/workflows/build-and-push.yml`):
+- Uses `docker/build-push-action` with BuildKit
+- `platforms: linux/amd64` — critical because OVH nodes are x86 but dev machines are ARM
+- `cache-from: type=gha` — caches Docker layers in GitHub's cache (fast rebuilds)
+- `${{ secrets.GITHUB_TOKEN }}` — automatic OIDC token, no stored secrets needed
+
+### Production promotion
+
+Staging gets `staging-latest` automatically. Production uses pinned tags:
+
+```bash
+# Tag the current staging image as v1.1.0
+docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:v1.1.0
+docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
+
+# Update production overlay and push to Git
+cd overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
+git commit -am "Promote v1.1.0" && git push
+# ArgoCD picks it up → production updated
+```
+
+---
+
+## How Health Checks Work
+
+K8s needs to know if your app is alive and ready to serve traffic.
+
+### Readiness probe
+
+"Is this pod ready to receive traffic?"
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /up        # Django middleware endpoint
+    port: http
+  initialDelaySeconds: 10    # Wait 10s after start
+  periodSeconds: 10          # Check every 10s
+```
+
+If the probe fails, K8s removes the pod from the Service's endpoints. Traefik stops sending traffic to it. Once it passes again, traffic resumes.
+
+### Liveness probe
+
+"Is this pod still alive, or is it stuck?"
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /up
+    port: http
+  initialDelaySeconds: 30    # Wait 30s before first check
+  periodSeconds: 30
+```
+
+If the probe fails repeatedly, K8s kills and restarts the pod.
+
+### Why `/up` instead of `/health/`
+
+We use `/up` (a Django middleware endpoint) instead of `/health/` (the django-health-check endpoint) because:
+- `/health/` goes through Django's full request pipeline, including `ALLOWED_HOSTS` validation
+- K8s probes hit the pod via its internal IP (e.g., `10.2.0.139:8000`), which isn't in `ALLOWED_HOSTS`
+- `/up` is handled by middleware *before* `ALLOWED_HOSTS` — it always returns "OK"
+
+---
+
+## Resource Requests and Limits
+
+Every container declares how much CPU/memory it needs.
+
+```yaml
+resources:
+  requests:          # Guaranteed minimum
+    cpu: 25m         # 25 millicores = 2.5% of one CPU
+    memory: 128Mi    # 128 megabytes
+  limits:            # Maximum allowed
+    cpu: 500m        # 50% of one CPU
+    memory: 512Mi    # 512 megabytes
+```
+
+**Requests** = what the scheduler uses to place pods on nodes. If a node has 2 CPUs and your pods request 2.1 CPUs total, the scheduler can't fit them → `Insufficient cpu` error.
+
+**Limits** = the ceiling. If a container exceeds memory limits, K8s kills it (OOMKilled). CPU is throttled, not killed.
+
+**Our resource budget** (per environment):
+| Component | CPU request | Memory request |
+|-----------|-------------|----------------|
+| Web | 25m | 128Mi |
+| Celery | 25m | 128Mi |
+| Beat | 10m | 64Mi |
+| PostgreSQL | 50m | 256Mi |
+| Redis | 50m | 64Mi |
+| **Total per env** | **160m** | **640Mi** |
+
+Two environments + infrastructure (ArgoCD, Traefik, cert-manager, CNPG operator) fit comfortably on 2× B3-8 nodes (4 CPUs, 16GB total).
+
+---
+
+## Debugging Commands
+
+When something goes wrong, these commands tell you what's happening:
 
 ```bash
 # What's running?
 kubectl get pods -n staging
-kubectl get pods -n production
 
 # Why won't my pod start?
 kubectl describe pod <pod-name> -n staging
-kubectl get events -n staging --sort-by='.lastTimestamp'
+# Look at Events section at the bottom
 
 # What are the logs?
-kubectl logs <pod-name> -n staging                    # Main container
-kubectl logs <pod-name> -n staging -c migrate         # Init container
-kubectl logs <pod-name> -n staging --previous         # Previous crash
+kubectl logs <pod-name> -n staging -c web        # Main container
+kubectl logs <pod-name> -n staging -c migrate     # Init container
+kubectl logs <pod-name> -n staging --previous     # Previous crash
 
 # What's inside the pod?
-kubectl exec -it <pod-name> -n staging -- bash
-kubectl exec -it <pod-name> -n staging -- env | grep DATABASE
+kubectl exec -it <pod-name> -n staging -c web -- bash
+kubectl exec -it <pod-name> -n staging -c web -- env | grep DATABASE
 
 # Is my service reachable?
-kubectl run debug --image=busybox --rm -it --restart=Never -- wget -qO- http://notafilia-web.staging:8000/health/
-
-# What does ArgoCD think?
-argocd app list
-argocd app get notafilia-staging
-argocd app diff notafilia-staging
+kubectl run debug --image=busybox --rm -it --restart=Never -- \
+  wget -qO- http://notafilia-web.staging:8000/up
 
 # What resources exist?
 kubectl get all -n staging
-kubectl get clusters.postgresql.cnpg.io -n staging
-kubectl get httproutes -n staging
-kubectl get certificates -n staging
+
+# What does ArgoCD think?
+kubectl get applications -n argocd
+argocd app get notafilia-staging --grpc-web
 
 # Resource usage
-kubectl top pods -n staging
 kubectl top nodes
+kubectl top pods -n staging
 ```
 
 ---
 
 ## Glossary
 
-| Term | Meaning |
-|------|---------|
-| **CRD** | Custom Resource Definition — extends the K8s API with new resource types (e.g., `Cluster` for CloudNativePG) |
-| **CR** | Custom Resource — an instance of a CRD |
-| **Operator** | A controller that watches CRs and manages complex software (CloudNativePG, cert-manager) |
-| **GitOps** | Infrastructure managed through Git. The repo is the single source of truth. |
-| **Reconciliation** | The process of making actual state match desired state. ArgoCD reconciles Git → cluster. |
-| **Self-heal** | ArgoCD reverts manual changes to match Git |
-| **Prune** | ArgoCD deletes resources removed from Git |
-| **SOPS** | Secrets OPerationS — encrypts values in YAML files |
-| **age** | Modern encryption tool. Simpler alternative to PGP. |
-| **PVC** | Persistent Volume Claim — how pods request durable storage |
-| **Init container** | A container that runs before the main container (used for migrations) |
-| **LoadBalancer** | Service type that gets an external IP from the cloud provider |
-| **ClusterIP** | Service type that's only reachable within the cluster |
-| **HTTPRoute** | Gateway API resource that routes HTTP traffic to Services |
-| **HelmRelease / Application** | How GitOps tools (Flux / ArgoCD) install Helm charts declaratively |
+| Term | Meaning | Our example |
+|------|---------|-------------|
+| **Pod** | Smallest runnable unit (one or more containers) | `notafilia-web-74cb999499-8nb52` |
+| **Deployment** | Manages Pods, ensures desired count runs | `notafilia-web` (1 replica) |
+| **Service** | Stable network endpoint for Pods | `notafilia-web` (ClusterIP:8000) |
+| **Namespace** | Isolation boundary | `staging`, `production` |
+| **ConfigMap** | Non-secret configuration data | `notafilia-config` (DJANGO_SETTINGS_MODULE, etc.) |
+| **Secret** | Sensitive configuration data | `notafilia-secrets` (DATABASE_URL, SECRET_KEY) |
+| **PVC** | Persistent storage request | `redis-data` (2Gi SSD) |
+| **CRD** | Custom Resource Definition — extends K8s API | `Cluster` (CloudNativePG), `Certificate` (cert-manager) |
+| **Operator** | Controller that manages complex software via CRDs | CloudNativePG, cert-manager |
+| **Gateway** | Network entry point (port listener + TLS) | `traefik-gateway` (ports 80/443) |
+| **HTTPRoute** | Routes traffic from Gateway to Services | `notafilia` (host → notafilia-web:8000) |
+| **Application** | ArgoCD resource that syncs Git → cluster | `notafilia-staging` |
+| **Sync** | ArgoCD making cluster match Git | Automatic every ~3 minutes |
+| **Self-heal** | ArgoCD reverting manual cluster changes | Enabled on all our apps |
+| **Init container** | Runs before main container | `migrate` (runs Django migrations) |
+| **LoadBalancer** | Service type that gets a public IP | Traefik (57.128.58.136) |
+| **ClusterIP** | Service type only reachable inside cluster | notafilia-web, redis-master |
+| **Sync wave** | ArgoCD ordering mechanism | Operators (wave 0) before CRD instances (wave 1) |
+| **Kustomize overlay** | Environment-specific patches | `overlays/staging/` patches base for staging |
+| **SOPS** | Encrypts secret values in YAML files | `secrets.enc.yaml` |
+| **age** | Encryption algorithm used with SOPS | Public key in `.sops.yaml` |
+
+---
+
+## Recommended Reading
+
+Start with these, in order:
+
+1. [Understanding Kubernetes Objects](https://kubernetes.io/docs/concepts/overview/working-with-objects/) (15 min)
+2. [Pods](https://kubernetes.io/docs/concepts/workloads/pods/) (10 min)
+3. [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) (15 min)
+4. [Services](https://kubernetes.io/docs/concepts/services-networking/service/) (10 min)
+5. [Kustomize Tutorial](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/) (20 min)
+6. [Gateway API Introduction](https://gateway-api.sigs.k8s.io/) (15 min)
+7. [ArgoCD Getting Started](https://argo-cd.readthedocs.io/en/stable/getting_started/) (30 min)
+8. [CloudNativePG Quickstart](https://cloudnative-pg.io/documentation/current/quickstart/) (20 min)
+9. [cert-manager Concepts](https://cert-manager.io/docs/concepts/) (15 min)
+10. [kubectl Cheat Sheet](https://kubernetes.io/docs/reference/kubectl/cheatsheet/) (bookmark this)
+
+**Total: ~3 hours.** Most learning happens by doing — use these as references while working through the setup guide.
