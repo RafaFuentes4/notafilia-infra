@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: notafilia-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/RafaFuentes4/notafilia-infra.git
+    targetRevision: main
+    path: overlays/staging
+    plugin:
+      name: kustomize-sops
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notafilia-config
+data:
+  DJANGO_SETTINGS_MODULE: "notafilia.settings_production"
+  ALLOWED_HOSTS: "*"  # Overridden per environment in overlays
+  USE_S3_MEDIA: "True"
+  AWS_STORAGE_BUCKET_NAME: "notafilia-media"
+  DEFAULT_FROM_EMAIL: "rafafcantero@gmail.com"
+  SERVER_EMAIL: "noreply@notafilia.com"

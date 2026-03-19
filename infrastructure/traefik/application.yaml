@@ -1,0 +1,57 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://traefik.github.io/charts
+    targetRevision: "34.*"
+    chart: traefik
+    helm:
+      values: |
+        providers:
+          kubernetesGateway:
+            enabled: true
+
+        gateway:
+          enabled: true
+          name: traefik-gateway
+          listeners:
+            - name: web
+              protocol: HTTP
+              port: 80
+            - name: websecure
+              protocol: HTTPS
+              port: 443
+              tls:
+                mode: Terminate
+                certificateRefs:
+                  - name: notafilia-tls
+
+        ingressRoute:
+          dashboard:
+            enabled: true
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+
+        service:
+          type: LoadBalancer
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notafilia-celery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notafilia
+      app.kubernetes.io/component: celery
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notafilia
+        app.kubernetes.io/component: celery
+    spec:
+      containers:
+        - name: celery
+          image: ghcr.io/rafafuentes4/notafilia:latest
+          command:
+            - celery
+            - -A
+            - notafilia
+            - worker
+            - -l
+            - INFO
+            - --pool
+            - threads
+            - --concurrency
+            - "20"
+          envFrom:
+            - configMapRef:
+                name: notafilia-config
+            - secretRef:
+                name: notafilia-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

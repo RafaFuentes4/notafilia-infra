@@ -1,0 +1,41 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: notafilia-pg
+  namespace: production
+spec:
+  instances: 2
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+
+  bootstrap:
+    initdb:
+      database: notafilia
+      owner: notafilia
+
+  storage:
+    size: 20Gi
+    storageClass: csi-cinder-high-speed  # Verify with kubectl get storageclass
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+  # Optional: backup to S3 (configure when needed)
+  # backup:
+  #   barmanObjectStore:
+  #     destinationPath: s3://notafilia-pg-backups/production
+  #     s3Credentials:
+  #       accessKeyId:
+  #         name: pg-backup-creds
+  #         key: ACCESS_KEY_ID
+  #       secretAccessKey:
+  #         name: pg-backup-creds
+  #         key: SECRET_ACCESS_KEY

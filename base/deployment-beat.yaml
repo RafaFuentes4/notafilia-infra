@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notafilia-beat
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notafilia
+      app.kubernetes.io/component: beat
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notafilia
+        app.kubernetes.io/component: beat
+    spec:
+      containers:
+        - name: beat
+          image: ghcr.io/rafafuentes4/notafilia:latest
+          command:
+            - celery
+            - -A
+            - notafilia
+            - beat
+            - -l
+            - INFO
+          envFrom:
+            - configMapRef:
+                name: notafilia-config
+            - secretRef:
+                name: notafilia-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

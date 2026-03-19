@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: production
+
+resources:
+  - ../../base
+  - secrets.enc.yaml
+
+patches:
+  - target:
+      kind: HTTPRoute
+      name: notafilia
+    patch: |-
+      - op: replace
+        path: /spec/hostnames/0
+        value: notafilia.com
+
+  - target:
+      kind: ConfigMap
+      name: notafilia-config
+    patch: |-
+      - op: replace
+        path: /data/ALLOWED_HOSTS
+        value: "notafilia.com"
+
+  # Production gets more resources
+  - target:
+      kind: Deployment
+      name: notafilia-web
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "250m"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "1"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "1Gi"
+
+images:
+  - name: ghcr.io/rafafuentes4/notafilia
+    newTag: v1.0.0

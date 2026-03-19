@@ -1,0 +1,32 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: notafilia-pg
+  namespace: staging
+spec:
+  instances: 1
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: "128MB"
+
+  bootstrap:
+    initdb:
+      database: notafilia
+      owner: notafilia
+
+  storage:
+    size: 10Gi
+    # OVH storage class — verify with: kubectl get storageclass
+    # Common OVH classes: csi-cinder-high-speed, csi-cinder-classic
+    # If neither exists, omit storageClass to use the cluster default
+    storageClass: csi-cinder-high-speed
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
