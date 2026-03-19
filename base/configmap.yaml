@@ -8,4 +8,4 @@ data:
   USE_S3_MEDIA: "True"
   AWS_STORAGE_BUCKET_NAME: "notafilia-media"
   DEFAULT_FROM_EMAIL: "rafafcantero@gmail.com"
-  SERVER_EMAIL: "noreply@notafilia.com"
+  SERVER_EMAIL: "noreply@notafilia.es"

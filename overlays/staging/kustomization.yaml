@@ -16,7 +16,7 @@ patches:
     patch: |-
       - op: replace
         path: /spec/hostnames/0
-        value: staging.notafilia.com
+        value: staging.notafilia.es
 
   # Override ALLOWED_HOSTS in ConfigMap
   - target:
@@ -25,7 +25,7 @@ patches:
     patch: |-
       - op: replace
         path: /data/ALLOWED_HOSTS
-        value: "staging.notafilia.com"
+        value: "staging.notafilia.es"
 
 images:
   - name: ghcr.io/rafafuentes4/notafilia

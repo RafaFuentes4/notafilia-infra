@@ -15,7 +15,7 @@ patches:
     patch: |-
       - op: replace
         path: /spec/hostnames/0
-        value: notafilia.com
+        value: notafilia.es
 
   - target:
       kind: ConfigMap
@@ -23,7 +23,7 @@ patches:
     patch: |-
       - op: replace
         path: /data/ALLOWED_HOSTS
-        value: "notafilia.com"
+        value: "notafilia.es"
 
   # Production gets more resources
   - target:
