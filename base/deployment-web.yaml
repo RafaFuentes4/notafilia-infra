@@ -14,6 +14,8 @@ spec:
         app.kubernetes.io/name: notafilia
         app.kubernetes.io/component: web
     spec:
+      imagePullSecrets:
+        - name: ghcr-credentials
       initContainers:
         - name: migrate
           image: ghcr.io/rafafuentes4/notafilia:latest
