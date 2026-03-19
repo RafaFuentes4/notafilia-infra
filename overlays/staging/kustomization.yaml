@@ -29,4 +29,4 @@ patches:
 
 images:
   - name: ghcr.io/rafafuentes4/notafilia
-    newTag: staging-latest
+    newTag: "0.1.0"
