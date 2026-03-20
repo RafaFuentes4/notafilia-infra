@@ -561,160 +561,223 @@ Package settings: https://github.com/users/RafaFuentes4/packages/container/notaf
 
 ---
 
-## 7. Per-Branch Deployments (Preview Environments)
+## 7. Preview Environments (Per-Branch Deployments)
 
-Deploy a feature branch to its own namespace with its own URL (e.g., `feature-xyz.notafilia.es`).
+Preview environments let you test a feature branch on a real URL before merging to main. Each branch gets its own isolated deployment at `<branch-name>.notafilia.es`.
 
-### Step 1: Create the namespace
+### What happens when you create a preview
+
+The `preview-create.sh` script does all of this for you:
+
+1. **Builds a Docker image** from your branch code (linux/amd64)
+2. **Pushes it to GHCR** with the branch name as the tag
+3. **Creates a K8s namespace** named after the branch
+4. **Copies secrets** from the staging namespace (reuses staging database)
+5. **Deploys** the app using the staging Kustomize overlay with branch-specific patches
+6. **Updates the Django Site** object so API URLs work correctly
+
+The result: a fully working copy of the app at `http://<branch>.notafilia.es`.
+
+### Prerequisites (one-time setup)
+
+**Wildcard DNS** — Already configured. A `*.notafilia.es` A record points to `57.128.58.136`. Any subdomain works automatically.
+
+**GHCR public** — Already configured. No imagePullSecret needed.
+
+**jq installed** — The script uses `jq` to copy secrets. Install with `brew install jq` if needed.
+
+### Quick start
 
 ```bash
-BRANCH=feature-xyz
-kubectl create namespace $BRANCH
+cd ~/Developer/notafilia-infra
+
+# Create a preview environment
+./scripts/preview-create.sh my-feature
+
+# Your app is at: http://my-feature.notafilia.es
+
+# When done, tear it down
+./scripts/preview-destroy.sh my-feature
 ```
 
-### Step 2: Create imagePullSecret
+### Full walkthrough (tested and verified)
 
-```bash
-gh auth token | xargs -I {} kubectl create secret docker-registry ghcr-credentials \
-  --docker-server=ghcr.io \
-  --docker-username=RafaFuentes4 \
-  --docker-password={} \
-  -n $BRANCH
-```
+Here's the exact workflow we tested with a real change:
 
-### Step 3: Build and push the branch image
+#### Step 1: Create a feature branch with your changes
 
 ```bash
 cd ~/Developer/notafilia
-git checkout feature-xyz
+git checkout -b my-cool-feature
 
+# Make your changes
+# For example, edit templates/web/components/hero.html
+
+# Commit (don't push to main — this is just for preview)
+git add . && git commit -m "feat: my cool feature"
+```
+
+#### Step 2: Run the preview script
+
+```bash
+cd ~/Developer/notafilia-infra
+./scripts/preview-create.sh my-cool-feature
+```
+
+What you'll see:
+
+```
+=== Creating preview environment ===
+Branch:    my-cool-feature
+Namespace: my-cool-feature
+Domain:    my-cool-feature.notafilia.es
+Image:     ghcr.io/rafafuentes4/notafilia:my-cool-feature
+
+>>> Building Docker image...
+[... Docker build output ...]
+
+>>> Creating namespace my-cool-feature...
+namespace/my-cool-feature created
+
+>>> Copying secrets from staging...
+secret/notafilia-secrets created
+
+>>> Deploying...
+configmap/notafilia-config created
+service/notafilia-web created
+deployment.apps/notafilia-beat created
+deployment.apps/notafilia-celery created
+deployment.apps/notafilia-web created
+httproute.gateway.networking.k8s.io/notafilia created
+
+>>> Waiting for pods...
+deployment "notafilia-web" successfully rolled out
+
+>>> Updating Django Site...
+Site updated: my-cool-feature.notafilia.es
+
+=== Preview environment ready ===
+URL: http://my-cool-feature.notafilia.es
+```
+
+Total time: ~2-3 minutes (mostly Docker build + image push).
+
+#### Step 3: Test your changes
+
+Open `http://my-cool-feature.notafilia.es` in your browser. You should see your changes live.
+
+You can also check the pods:
+
+```bash
+use-notafilia
+kubectl get pods -n my-cool-feature
+```
+
+#### Step 4: Make more changes (optional)
+
+If you need to iterate, rebuild and redeploy:
+
+```bash
+cd ~/Developer/notafilia
+# Make more changes, commit...
+
+# Rebuild the image
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
-  -t ghcr.io/rafafuentes4/notafilia:$BRANCH \
+  -t ghcr.io/rafafuentes4/notafilia:my-cool-feature \
   --push .
+
+# Restart pods to pick up the new image
+kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n my-cool-feature
 ```
 
-### Step 4: Create the secrets
+#### Step 5: Tear down when done
 
 ```bash
-# Get staging PG password (reuse staging DB, or create a new PG cluster)
-STAGING_PG_PASS=$(kubectl get secret notafilia-pg-app -n staging -o jsonpath='{.data.password}' | base64 -d)
-
-kubectl apply -n $BRANCH -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: notafilia-secrets
-type: Opaque
-stringData:
-  SECRET_KEY: "$(python3 -c 'from secrets import token_urlsafe; print(token_urlsafe(50))')"
-  DATABASE_URL: "postgresql://notafilia:${STAGING_PG_PASS}@notafilia-pg-rw.staging:5432/notafilia"
-  REDIS_URL: "redis://redis-master.staging:6379/1"
-  AWS_ACCESS_KEY_ID: ""
-  AWS_SECRET_ACCESS_KEY: ""
-  SENTRY_DSN: ""
-  TURNSTILE_KEY: ""
-  TURNSTILE_SECRET: ""
-  ANTHROPIC_API_KEY: ""
-  DEFAULT_AI_MODEL: "claude-sonnet-4-6"
-  OPENAI_API_KEY: ""
-EOF
+cd ~/Developer/notafilia-infra
+./scripts/preview-destroy.sh my-cool-feature
 ```
 
-> **Note**: This reuses the staging PostgreSQL (same database!) and Redis (different DB index: `/1`). For full isolation, create a separate PG Cluster CR in the new namespace.
+This deletes the entire namespace and everything in it (pods, services, secrets). The Docker image stays in GHCR but that's fine — it doesn't cost anything.
 
-### Step 5: Deploy with Kustomize
-
-Create a temporary overlay:
+#### Step 6: Merge to main (normal workflow)
 
 ```bash
-mkdir -p /tmp/preview-$BRANCH
-
-cat > /tmp/preview-$BRANCH/kustomization.yaml <<EOF
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-namespace: $BRANCH
-resources:
-  - ../../Developer/notafilia-infra/base
-patches:
-  - target:
-      kind: HTTPRoute
-      name: notafilia
-    patch: |-
-      - op: replace
-        path: /spec/hostnames/0
-        value: ${BRANCH}.notafilia.es
-  - target:
-      kind: ConfigMap
-      name: notafilia-config
-    patch: |-
-      - op: replace
-        path: /data/ALLOWED_HOSTS
-        value: "${BRANCH}.notafilia.es"
-images:
-  - name: ghcr.io/rafafuentes4/notafilia
-    newTag: $BRANCH
-EOF
-
-kubectl apply -k /tmp/preview-$BRANCH/
+cd ~/Developer/notafilia
+git checkout main
+git merge my-cool-feature
+git push
+# CI auto-deploys to staging
 ```
 
-### Step 6: Add DNS record
+### How it works under the hood
 
-Add an A record for `feature-xyz.notafilia.es` → `57.128.58.136`
+The preview environment:
 
-Or use a wildcard: `*.notafilia.es` → `57.128.58.136` (then any branch works without manual DNS).
+- **Reuses the staging PostgreSQL database** — your preview shares the same data as staging. This means you can test with real data, but also means database changes in the preview affect staging. For full isolation, you'd need a separate PG cluster (not covered by the script).
+- **Reuses staging Redis** — same Redis instance, same database index.
+- **Gets its own namespace** — all K8s resources (pods, services, configmaps) are isolated in a namespace named after the branch.
+- **Routes via Gateway API** — Traefik's wildcard DNS + the HTTPRoute resource route `<branch>.notafilia.es` to the preview's web service.
+- **No HTTPS** — preview environments use HTTP only. The TLS certificate only covers `notafilia.es` and `staging.notafilia.es`. Wildcard certs require DNS-01 challenges which need DNS provider API integration.
 
-### Step 7: Update Django Site
+### Multiple preview environments
+
+You can run multiple preview environments simultaneously:
 
 ```bash
-kubectl exec -n $BRANCH deployment/notafilia-web -c web -- \
+./scripts/preview-create.sh feature-auth
+./scripts/preview-create.sh feature-billing
+./scripts/preview-create.sh bugfix-login
+
+# Three separate deployments:
+# http://feature-auth.notafilia.es
+# http://feature-billing.notafilia.es
+# http://bugfix-login.notafilia.es
+
+# List all preview namespaces
+kubectl get namespaces | grep -v -E "staging|production|argocd|cert-manager|cnpg|traefik|kube|default"
+
+# Tear down individually
+./scripts/preview-destroy.sh feature-auth
+```
+
+Be mindful of cluster resources — each preview environment runs 3 pods (web, celery, beat). With 2 nodes, you can comfortably run 2-3 previews alongside staging and production.
+
+### Troubleshooting preview environments
+
+#### Pods in CrashLoopBackOff
+```bash
+kubectl logs -n my-feature deployment/notafilia-web -c migrate --tail=20
+```
+Usually means the staging PG is not reachable or the password changed. Destroy and recreate.
+
+#### "Connection refused" on the URL
+The pods might not be ready yet. Check:
+```bash
+kubectl get pods -n my-feature
+```
+Wait for all pods to show `1/1 Running`.
+
+#### API errors / "bad request"
+The Django Site object might not have been updated. Fix manually:
+```bash
+kubectl exec -n my-feature deployment/notafilia-web -c web -- \
   python manage.py shell -c "
 from django.contrib.sites.models import Site
 site = Site.objects.get(id=1)
-site.domain = '${BRANCH}.notafilia.es'
+site.domain = 'my-feature.notafilia.es'
 site.save()
 "
 ```
 
-### Cleanup
+#### Branch name has slashes (e.g., `feature/my-thing`)
+K8s namespace names can't contain slashes. Use dashes: `feature-my-thing`.
 
+#### Script fails with "kubectl connection refused"
+The script sets the kubectl context automatically, but if you have a port-forward running on port 8080 (ArgoCD), kill it first:
 ```bash
-kubectl delete namespace $BRANCH
-# This deletes everything in the namespace (pods, services, secrets, PVCs)
+lsof -ti:8080 | xargs kill 2>/dev/null
 ```
-
-### Automating preview environments
-
-For full automation, you can use ArgoCD ApplicationSets with a Pull Request generator:
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
-metadata:
-  name: preview-environments
-  namespace: argocd
-spec:
-  generators:
-    - pullRequest:
-        github:
-          owner: RafaFuentes4
-          repo: notafilia
-        requeueAfterSeconds: 60
-  template:
-    metadata:
-      name: "preview-{{branch}}"
-    spec:
-      source:
-        repoURL: https://github.com/RafaFuentes4/notafilia-infra.git
-        path: overlays/staging  # Use staging as base
-        targetRevision: main
-      destination:
-        server: https://kubernetes.default.svc
-        namespace: "preview-{{branch}}"
-```
-
-This auto-creates/destroys preview environments for every open PR. Full setup requires additional work (image building per PR, DNS wildcard, etc.).
 
 ---
 
