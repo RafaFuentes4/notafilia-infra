@@ -300,12 +300,10 @@ This single command bootstraps everything:
 
 ### 5.1 Build and push Docker image
 
-> **Note**: This is now fully automated via CI/CD:
-> - **Push to `main`** → CI builds image → dispatches to infra repo → staging auto-updates (no manual step needed)
-> - **Version tag `v*`** → CI builds image → dispatches to infra repo → BOTH staging + production auto-update
-> - ArgoCD polling interval is 30 seconds
+> **Note**: CI now builds images only on version tags (`v*`). Pushing to `main` does not trigger a build.
+> After CI builds the image, deployment is manual: update the tag in the relevant overlay and push. ArgoCD picks up the change within 30 seconds.
 >
-> The manual steps below are only needed for initial setup or if CI is unavailable.
+> The manual build steps below are only needed for initial setup or if CI is unavailable.
 
 > **Critical**: Build for `linux/amd64` — OVH nodes are x86_64, your Mac is ARM. Building without `--platform` gives `exec format error`.
 
@@ -319,7 +317,7 @@ gh auth token | docker login ghcr.io -u <github-username> --password-stdin
 # Build and push for amd64
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
-  -t ghcr.io/rafafuentes4/notafilia:staging-latest \
+  -t ghcr.io/rafafuentes4/notafilia:0.1.0 \
   --push .
 
 # Also tag for production
@@ -446,26 +444,18 @@ curl -sk https://staging.notafilia.es/up
 
 ## 7. Phase 6: CI/CD
 
-### 7.1 GitHub Actions workflow (fully automated)
+### 7.1 GitHub Actions workflow
 
 File: `notafilia/.github/workflows/build-and-push.yml` (in the **app** repo, not infra)
 
-The pipeline is fully automated via `repository_dispatch` to the infra repo:
-
-- **Push to `main`** → CI builds image → dispatches to infra repo → staging overlay auto-updated → ArgoCD syncs within 30 seconds
-- **Version tag `v*`** → CI builds image → dispatches to infra repo → BOTH staging + production overlays auto-updated → ArgoCD syncs within 30 seconds
-
-On every push to `main`:
-1. Builds `linux/amd64` Docker image from `Dockerfile.web`
-2. Pushes to GHCR with tags: `${{ github.sha }}` + `staging-latest`
-3. Uses GitHub Actions cache for fast builds
-4. Dispatches `repository_dispatch` to `notafilia-infra` to update image tags
+CI only builds on version tags (`v*`). Pushing to `main` does **not** trigger a build.
 
 On version tags (`v*`):
-1. Same build + push steps
-2. Dispatches to infra repo, which updates both staging and production overlays
+1. Builds `linux/amd64` Docker image from `Dockerfile.web`
+2. Pushes to GHCR with semver tags: `0.3.0`, `0.3`, `sha-xxx`
+3. Uses GitHub Actions cache for fast builds
 
-No manual `kubectl rollout restart` or image tagging is needed.
+Deployment is manual: after CI builds the image, update the tag in `overlays/staging/kustomization.yaml` (or `overlays/production/kustomization.yaml`), commit, and push. ArgoCD picks up the change within 30 seconds.
 
 ### 7.2 GHCR package permissions
 
@@ -476,27 +466,14 @@ The workflow uses `${{ secrets.GITHUB_TOKEN }}` (automatic OIDC). But the GHCR p
 
 ### 7.3 Production promotion
 
-Production promotion is automated: push a `v*` tag to the app repo and CI handles everything.
+After testing staging, promote to production by updating the production overlay:
 
 ```bash
-# Create a version tag — CI does the rest
-git tag v1.1.0
-git push origin v1.1.0
-# CI builds → dispatches to infra repo → staging + production auto-update
-```
-
-Manual promotion (if CI is unavailable):
-
-```bash
-# Tag the staging image
-docker pull ghcr.io/rafafuentes4/notafilia:staging-latest
-docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:v1.1.0
-docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
-
-# Update production overlay
 cd notafilia-infra/overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
-git commit -am "Promote v1.1.0 to production" && git push
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+git add overlays/production && git commit -m "chore: deploy 0.3.0 to production" && git push
+# ArgoCD picks up the change within ~30 seconds
 ```
 
 ---
@@ -706,7 +683,7 @@ Internet → DNS (notafilia.es / staging.notafilia.es)
 - SOPS + age encrypted secrets
 - Init container migrations (run before Gunicorn starts)
 - S3 media storage (OVH Object Storage, bucket: notafilia-media, region: GRA)
-- Automated CI/CD (push to main auto-deploys staging, version tags deploy both staging + production)
+- CI/CD (version tags trigger image builds, manual deployment via infra repo overlay updates, ArgoCD syncs within 30 seconds)
 - Preview environments (scripts in `scripts/`)
 - Wildcard DNS (`*.notafilia.es`)
 - PostgreSQL automated daily backups to S3 (production, retain 2 days)
@@ -820,18 +797,36 @@ Add more nodes in OVH console (Node pools tab → increase count).
 
 ## 13. Common Operations
 
-### Deploy a new app version to staging
+### Deploy a new app version
 
-Push to `main` → CI builds and pushes image → dispatches to infra repo → staging overlay auto-updated → ArgoCD syncs within 30 seconds. No manual step needed.
+1. Create a version tag in the app repo to trigger CI:
+
+```bash
+cd ~/Developer/notafilia
+git tag v0.3.0 && git push origin v0.3.0
+# CI builds image (1-3 min) — produces tags: 0.3.0, 0.3, sha-xxx
+```
+
+2. Deploy to staging:
+
+```bash
+cd ~/Developer/notafilia-infra/overlays/staging
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+git add overlays/staging && git commit -m "chore: deploy 0.3.0 to staging" && git push
+# ArgoCD syncs within ~30 seconds
+```
 
 ### Promote staging to production
 
-Push a version tag — CI handles everything:
+After testing staging, update the production overlay:
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
-# CI builds → dispatches to infra repo → staging + production auto-update
+cd ~/Developer/notafilia-infra/overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+git add overlays/production && git commit -m "chore: deploy 0.3.0 to production" && git push
+# ArgoCD syncs within ~30 seconds
 ```
 
 ### Access ArgoCD UI
