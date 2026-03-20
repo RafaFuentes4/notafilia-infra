@@ -16,8 +16,6 @@ spec:
         app.kubernetes.io/name: notafilia
         app.kubernetes.io/component: beat
     spec:
-      imagePullSecrets:
-        - name: ghcr-credentials
       containers:
         - name: beat
           image: ghcr.io/rafafuentes4/notafilia:latest

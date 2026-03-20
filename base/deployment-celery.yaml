@@ -14,8 +14,6 @@ spec:
         app.kubernetes.io/name: notafilia
         app.kubernetes.io/component: celery
     spec:
-      imagePullSecrets:
-        - name: ghcr-credentials
       containers:
         - name: celery
           image: ghcr.io/rafafuentes4/notafilia:latest
