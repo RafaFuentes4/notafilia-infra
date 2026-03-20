@@ -35,6 +35,10 @@ jobs:
           git add overlays/
           TAG="${{ github.event.client_payload.tag }}"
           ENV="${{ github.event.client_payload.environment }}"
+          if git diff --cached --quiet; then
+            echo "No changes to commit (tag already up to date)"
+            exit 0
+          fi
           if [ "$ENV" = "both" ]; then
             git commit -m "chore: update image tag to ${TAG} in staging and production"
           else
