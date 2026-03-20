@@ -4,29 +4,29 @@ kind: Kustomization
 namespace: staging
 
 resources:
-  - ../../base
+- ../../base
   # secrets.enc.yaml is SOPS-encrypted and applied directly to the cluster.
   # Will be managed by ArgoCD once KSOPS plugin is configured.
 
-patches:
   # Override the hostname in HTTPRoute
-  - target:
-      kind: HTTPRoute
-      name: notafilia
-    patch: |-
-      - op: replace
-        path: /spec/hostnames/0
-        value: staging.notafilia.es
 
   # Override ALLOWED_HOSTS in ConfigMap
-  - target:
-      kind: ConfigMap
-      name: notafilia-config
-    patch: |-
-      - op: replace
-        path: /data/ALLOWED_HOSTS
-        value: "staging.notafilia.es"
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/hostnames/0
+      value: staging.notafilia.es
+  target:
+    kind: HTTPRoute
+    name: notafilia
+- patch: |-
+    - op: replace
+      path: /data/ALLOWED_HOSTS
+      value: "staging.notafilia.es"
+  target:
+    kind: ConfigMap
+    name: notafilia-config
 
 images:
-  - name: ghcr.io/rafafuentes4/notafilia
-    newTag: "0.1.0"
+- name: ghcr.io/rafafuentes4/notafilia
+  newTag: staging-latest
