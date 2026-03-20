@@ -993,6 +993,97 @@ kubectl get clusters.postgresql.cnpg.io -A
 # STATUS should be "Cluster in healthy state"
 ```
 
+### Automated backups (production)
+
+Production PostgreSQL has automated daily backups configured via CloudNativePG:
+
+- **Schedule:** Daily at 2:00 AM UTC
+- **Storage:** OVH Object Storage (`s3://notafilia-media/pg-backups/production/`)
+- **Retention:** 2 days (older backups auto-deleted)
+- **Method:** Barman (WAL archiving + base backups)
+- **Config:** `infrastructure/cloudnative-pg/cluster-production.yaml` (backup section) + `scheduled-backup-production.yaml`
+
+#### Check backup status
+
+```bash
+# List all backups
+kubectl get backups -n production
+
+# Check scheduled backup
+kubectl get scheduledbackups -n production
+
+# Detailed backup info
+kubectl describe backup <backup-name> -n production
+```
+
+#### Trigger a manual backup
+
+```bash
+kubectl apply -n production -f - <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: manual-backup-$(date +%Y%m%d-%H%M)
+  namespace: production
+spec:
+  method: barmanObjectStore
+  cluster:
+    name: notafilia-pg
+EOF
+
+# Watch it complete
+kubectl get backups -n production --watch
+```
+
+#### Restore from a backup
+
+If you need to restore production from a backup, you create a new Cluster that bootstraps from the backup:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: notafilia-pg-restored
+  namespace: production
+spec:
+  instances: 1
+  bootstrap:
+    recovery:
+      source: notafilia-pg-backup
+  externalClusters:
+    - name: notafilia-pg-backup
+      barmanObjectStore:
+        destinationPath: s3://notafilia-media/pg-backups/production
+        endpointURL: https://s3.gra.io.cloud.ovh.net
+        s3Credentials:
+          accessKeyId:
+            name: pg-backup-creds
+            key: ACCESS_KEY_ID
+          secretAccessKey:
+            name: pg-backup-creds
+            key: SECRET_ACCESS_KEY
+  storage:
+    size: 20Gi
+    storageClass: csi-cinder-high-speed
+```
+
+> **Warning:** This creates a NEW cluster alongside the existing one. After verifying the restored data, update the app's `DATABASE_URL` to point to `notafilia-pg-restored-rw` and delete the old cluster.
+
+#### Backup troubleshooting
+
+```bash
+# Check if the backup credentials work
+kubectl get secret pg-backup-creds -n production
+# Should exist with ACCESS_KEY_ID and SECRET_ACCESS_KEY
+
+# Check CNPG operator logs for backup errors
+kubectl logs -n cnpg-system -l app.kubernetes.io/name=cloudnative-pg --tail=30 | grep -i backup
+
+# Check if WAL archiving is working
+kubectl get cluster notafilia-pg -n production -o jsonpath='{.status.firstRecoverabilityPoint}'
+# Should show a timestamp if WAL archiving is active
+```
+
 ---
 
 ## 12. Certificate & TLS Management

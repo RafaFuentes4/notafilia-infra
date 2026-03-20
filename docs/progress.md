@@ -558,7 +558,48 @@ kubectl exec -n production deployment/notafilia-web -c web -- \
 
 Admin panel: `https://staging.notafilia.es/admin/`
 
-### 9.2 Run any management command
+### 9.2 Configure PostgreSQL backups (production only)
+
+Automated daily backups are configured via CloudNativePG. The setup requires:
+
+1. **Create backup credentials** in the production namespace:
+
+```bash
+kubectl create secret generic pg-backup-creds -n production \
+  --from-literal=ACCESS_KEY_ID=<your-ovh-s3-access-key> \
+  --from-literal=SECRET_ACCESS_KEY=<your-ovh-s3-secret-key>
+```
+
+2. **Backup config is in Git** — ArgoCD deploys it automatically:
+   - `infrastructure/cloudnative-pg/cluster-production.yaml` — backup section pointing to `s3://notafilia-media/pg-backups/production/`
+   - `infrastructure/cloudnative-pg/scheduled-backup-production.yaml` — daily schedule at 2:00 AM UTC, retain 2 days
+
+3. **Verify backups are running:**
+
+```bash
+kubectl get backups -n production
+kubectl get scheduledbackups -n production
+```
+
+4. **Trigger a manual test backup:**
+
+```bash
+kubectl apply -n production -f - <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: manual-test
+  namespace: production
+spec:
+  method: barmanObjectStore
+  cluster:
+    name: notafilia-pg
+EOF
+# Should show PHASE: completed within ~30 seconds
+kubectl get backups -n production
+```
+
+### 9.3 Run any management command
 
 ```bash
 kubectl exec -n staging deployment/notafilia-web -c web -- \
@@ -668,10 +709,10 @@ Internet → DNS (notafilia.es / staging.notafilia.es)
 - Automated CI/CD (push to main auto-deploys staging, version tags deploy both staging + production)
 - Preview environments (scripts in `scripts/`)
 - Wildcard DNS (`*.notafilia.es`)
+- PostgreSQL automated daily backups to S3 (production, retain 2 days)
 
 ## What's not yet done
 
-- PostgreSQL backups (scheduled backups to object storage)
 - SOPS decryption in ArgoCD (age key is mounted, but encrypted secrets are not yet used in overlays)
 - ArgoCD notifications (Slack/email alerts on sync failures)
 
