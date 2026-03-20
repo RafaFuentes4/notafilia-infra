@@ -7,5 +7,7 @@ data:
   ALLOWED_HOSTS: "*"  # Overridden per environment in overlays
   USE_S3_MEDIA: "True"
   AWS_STORAGE_BUCKET_NAME: "notafilia-media"
+  AWS_S3_ENDPOINT_URL: "https://s3.gra.io.cloud.ovh.net"
+  AWS_S3_CUSTOM_DOMAIN: "notafilia-media.s3.gra.io.cloud.ovh.net"
   DEFAULT_FROM_EMAIL: "rafafcantero@gmail.com"
   SERVER_EMAIL: "noreply@notafilia.es"
