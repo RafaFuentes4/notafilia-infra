@@ -4,36 +4,36 @@ kind: Kustomization
 namespace: production
 
 resources:
-  - ../../base
+- ../../base
   # secrets.enc.yaml is SOPS-encrypted and applied directly to the cluster.
   # Will be managed by ArgoCD once KSOPS plugin is configured.
 
-patches:
-  - target:
-      kind: HTTPRoute
-      name: notafilia
-    patch: |-
-      - op: replace
-        path: /spec/hostnames/0
-        value: notafilia.es
 
-  - target:
-      kind: ConfigMap
-      name: notafilia-config
-    patch: |-
-      - op: replace
-        path: /data/ALLOWED_HOSTS
-        value: "notafilia.es"
 
   # Production gets more resources
-  - target:
-      kind: Deployment
-      name: notafilia-web
-    patch: |-
-      - op: replace
-        path: /spec/replicas
-        value: 1
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/hostnames/0
+      value: notafilia.es
+  target:
+    kind: HTTPRoute
+    name: notafilia
+- patch: |-
+    - op: replace
+      path: /data/ALLOWED_HOSTS
+      value: "notafilia.es"
+  target:
+    kind: ConfigMap
+    name: notafilia-config
+- patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 1
+  target:
+    kind: Deployment
+    name: notafilia-web
 
 images:
-  - name: ghcr.io/rafafuentes4/notafilia
-    newTag: "0.1.0"
+- name: ghcr.io/rafafuentes4/notafilia
+  newTag: 0.2.0
