@@ -79,7 +79,7 @@ spec:
           command: ["python", "manage.py", "migrate", "--noinput"]
       containers:
         - name: web              # The main container
-          image: ghcr.io/rafafuentes4/notafilia:staging-latest
+          image: ghcr.io/rafafuentes4/notafilia:latest  # Overridden by overlay
           command: ["gunicorn", "--bind=0.0.0.0:8000", ...]
 ```
 
@@ -239,7 +239,7 @@ The base uses `ghcr.io/rafafuentes4/notafilia:latest`. The overlay changes the t
 ```yaml
 images:
   - name: ghcr.io/rafafuentes4/notafilia
-    newTag: staging-latest    # Or v1.0.0 for production
+    newTag: "0.2.0"    # CI auto-updates this via repository_dispatch
 ```
 
 Kustomize finds every reference to that image and replaces the tag. No editing deployment files.
@@ -284,7 +284,7 @@ notafilia-root (watches argocd/ directory)
 └── notafilia-production (watches overlays/production → app pods)
 ```
 
-**One `kubectl apply` deploys everything.** Push a change to Git and ArgoCD syncs it within 3 minutes.
+**One `kubectl apply` deploys everything.** Push a change to Git and ArgoCD syncs it within 30 seconds.
 
 ### Sync waves
 
@@ -457,14 +457,24 @@ creation_rules:
 
 ## How CI/CD Works
 
-### The pipeline
+### The pipeline (fully automated)
+
+The pipeline is fully automated — no manual steps needed for either environment:
 
 ```
 Developer pushes to main
   → GitHub Actions triggers
     → Builds Docker image (linux/amd64) from Dockerfile.web
       → Pushes to GHCR with tags: {sha} + staging-latest
-        → kubectl rollout restart picks up the new image
+        → Dispatches repository_dispatch to notafilia-infra
+          → Infra repo workflow updates staging overlay image tag
+            → ArgoCD detects change within 30 seconds → staging updated
+
+Developer pushes a version tag (v*)
+  → Same build + push steps
+    → Dispatches repository_dispatch to notafilia-infra
+      → Infra repo workflow updates BOTH staging + production overlay image tags
+        → ArgoCD detects change within 30 seconds → both environments updated
 ```
 
 **Workflow file** (`.github/workflows/build-and-push.yml`):
@@ -472,21 +482,18 @@ Developer pushes to main
 - `platforms: linux/amd64` — critical because OVH nodes are x86 but dev machines are ARM
 - `cache-from: type=gha` — caches Docker layers in GitHub's cache (fast rebuilds)
 - `${{ secrets.GITHUB_TOKEN }}` — automatic OIDC token, no stored secrets needed
+- `repository_dispatch` — triggers a workflow in the infra repo to update image tags
 
 ### Production promotion
 
-Staging gets `staging-latest` automatically. Production uses pinned tags:
+Production promotion is automated via version tags:
 
 ```bash
-# Tag the current staging image as v1.1.0
-docker tag ghcr.io/rafafuentes4/notafilia:staging-latest ghcr.io/rafafuentes4/notafilia:v1.1.0
-docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
-
-# Update production overlay and push to Git
-cd overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
-git commit -am "Promote v1.1.0" && git push
-# ArgoCD picks it up → production updated
+# Just push a version tag — CI handles everything
+git tag v1.1.0
+git push origin v1.1.0
+# CI builds → dispatches to infra repo → staging + production auto-update
+# ArgoCD syncs within 30 seconds
 ```
 
 ---
@@ -621,7 +628,7 @@ kubectl top pods -n staging
 | **Gateway** | Network entry point (port listener + TLS) | `traefik-gateway` (ports 80/443) |
 | **HTTPRoute** | Routes traffic from Gateway to Services | `notafilia` (host → notafilia-web:8000) |
 | **Application** | ArgoCD resource that syncs Git → cluster | `notafilia-staging` |
-| **Sync** | ArgoCD making cluster match Git | Automatic every ~3 minutes |
+| **Sync** | ArgoCD making cluster match Git | Automatic every ~30 seconds |
 | **Self-heal** | ArgoCD reverting manual cluster changes | Enabled on all our apps |
 | **Init container** | Runs before main container | `migrate` (runs Django migrations) |
 | **LoadBalancer** | Service type that gets a public IP | Traefik (57.128.58.136) |

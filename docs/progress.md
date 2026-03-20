@@ -133,7 +133,7 @@ notafilia-infra/
 - **Init container for migrations** — `manage.py migrate` runs before Gunicorn starts.
 - **Beat strategy: Recreate** — prevents duplicate scheduled tasks during deployments.
 - **`/up` for health probes** (not `/health/`) — `/up` uses Django middleware that bypasses `ALLOWED_HOSTS` validation. `/health/` gets blocked when accessed via pod IP.
-- **`imagePullSecrets` on all deployments** — GHCR packages are private by default.
+- **GHCR package is public** — no `imagePullSecrets` needed. If the package were ever made private again, you would need to add them.
 - **redis:7-alpine instead of Bitnami** — Broadcom ended free Bitnami images in Sep 2025.
 - **Gateway `namespacePolicy: All`** — allows HTTPRoutes in staging/production to reference the Gateway in the traefik namespace.
 - **Pin CNPG operator version** — wildcard versions cause auto-upgrade bootstrap loops.
@@ -300,6 +300,13 @@ This single command bootstraps everything:
 
 ### 5.1 Build and push Docker image
 
+> **Note**: This is now fully automated via CI/CD:
+> - **Push to `main`** → CI builds image → dispatches to infra repo → staging auto-updates (no manual step needed)
+> - **Version tag `v*`** → CI builds image → dispatches to infra repo → BOTH staging + production auto-update
+> - ArgoCD polling interval is 30 seconds
+>
+> The manual steps below are only needed for initial setup or if CI is unavailable.
+
 > **Critical**: Build for `linux/amd64` — OVH nodes are x86_64, your Mac is ARM. Building without `--platform` gives `exec format error`.
 
 ```bash
@@ -324,26 +331,13 @@ docker buildx build --platform linux/amd64 \
 
 ### 5.2 Configure GHCR package permissions
 
-GHCR packages are private by default. Go to:
-**https://github.com/users/RafaFuentes4/packages/container/notafilia/settings**
+Go to: **https://github.com/users/RafaFuentes4/packages/container/notafilia/settings**
 
 Under **Manage Actions access** → Add Repository → `notafilia` → Role: **Write**
 
-### 5.3 Create imagePullSecret in both namespaces
+### 5.3 imagePullSecret (not needed)
 
-```bash
-gh auth token | xargs -I {} kubectl create secret docker-registry ghcr-credentials \
-  --docker-server=ghcr.io \
-  --docker-username=RafaFuentes4 \
-  --docker-password={} \
-  -n staging
-
-gh auth token | xargs -I {} kubectl create secret docker-registry ghcr-credentials \
-  --docker-server=ghcr.io \
-  --docker-username=RafaFuentes4 \
-  --docker-password={} \
-  -n production
-```
+**GHCR is public.** No imagePullSecret needed. If the package were ever made private again, you would need to create imagePullSecrets in both namespaces.
 
 ### 5.4 Create app secrets
 
@@ -452,14 +446,26 @@ curl -sk https://staging.notafilia.es/up
 
 ## 7. Phase 6: CI/CD
 
-### 7.1 GitHub Actions workflow
+### 7.1 GitHub Actions workflow (fully automated)
 
 File: `notafilia/.github/workflows/build-and-push.yml` (in the **app** repo, not infra)
+
+The pipeline is fully automated via `repository_dispatch` to the infra repo:
+
+- **Push to `main`** → CI builds image → dispatches to infra repo → staging overlay auto-updated → ArgoCD syncs within 30 seconds
+- **Version tag `v*`** → CI builds image → dispatches to infra repo → BOTH staging + production overlays auto-updated → ArgoCD syncs within 30 seconds
 
 On every push to `main`:
 1. Builds `linux/amd64` Docker image from `Dockerfile.web`
 2. Pushes to GHCR with tags: `${{ github.sha }}` + `staging-latest`
 3. Uses GitHub Actions cache for fast builds
+4. Dispatches `repository_dispatch` to `notafilia-infra` to update image tags
+
+On version tags (`v*`):
+1. Same build + push steps
+2. Dispatches to infra repo, which updates both staging and production overlays
+
+No manual `kubectl rollout restart` or image tagging is needed.
 
 ### 7.2 GHCR package permissions
 
@@ -470,7 +476,16 @@ The workflow uses `${{ secrets.GITHUB_TOKEN }}` (automatic OIDC). But the GHCR p
 
 ### 7.3 Production promotion
 
-Production uses pinned tags (e.g., `v1.0.0`). To promote:
+Production promotion is automated: push a `v*` tag to the app repo and CI handles everything.
+
+```bash
+# Create a version tag — CI does the rest
+git tag v1.1.0
+git push origin v1.1.0
+# CI builds → dispatches to infra repo → staging + production auto-update
+```
+
+Manual promotion (if CI is unavailable):
 
 ```bash
 # Tag the staging image
@@ -499,10 +514,11 @@ kubectl get svc -n traefik
 
 In your domain registrar:
 
-| Type | Name | Value | TTL |
-|------|------|-------|-----|
-| A | `@` | `57.128.58.136` | 600 |
-| A | `staging` | `57.128.58.136` | 600 |
+| Type | Name | Value | TTL | Note |
+|------|------|-------|-----|------|
+| A | `@` | `57.128.58.136` | 600 | Production |
+| A | `staging` | `57.128.58.136` | 600 | Staging |
+| A | `*` | `57.128.58.136` | 600 | Wildcard for preview environments |
 
 ### 8.3 Verify
 
@@ -637,6 +653,30 @@ Internet → DNS (notafilia.es / staging.notafilia.es)
 
 ---
 
+## What's working
+
+- Django app (web + celery + celery beat) deployed across staging and production
+- PostgreSQL (CloudNativePG) with per-environment instances
+- Redis (official redis:7-alpine) with persistent storage
+- Traefik Gateway API routing with host-based routing
+- TLS/HTTPS via cert-manager + Let's Encrypt (auto-renewed)
+- HTTP-to-HTTPS redirect (301 permanent via Traefik)
+- ArgoCD GitOps with app-of-apps pattern
+- SOPS + age encrypted secrets
+- Init container migrations (run before Gunicorn starts)
+- S3 media storage (OVH Object Storage, bucket: notafilia-media, region: GRA)
+- Automated CI/CD (push to main auto-deploys staging, version tags deploy both staging + production)
+- Preview environments (scripts in `scripts/`)
+- Wildcard DNS (`*.notafilia.es`)
+
+## What's not yet done
+
+- PostgreSQL backups (scheduled backups to object storage)
+- SOPS decryption in ArgoCD (age key is mounted, but encrypted secrets are not yet used in overlays)
+- ArgoCD notifications (Slack/email alerts on sync failures)
+
+---
+
 ## 11. Gotchas & Lessons Learned
 
 These are the issues we hit during setup, in order. If you're recreating this from scratch using the final manifests, you should avoid most of them — but knowing about them helps if something goes wrong.
@@ -645,7 +685,7 @@ These are the issues we hit during setup, in order. If you're recreating this fr
 
 1. **Always build for `linux/amd64`**: Use `docker buildx build --platform linux/amd64`. Without this, ARM images cause `exec format error` on x86 nodes.
 
-2. **GHCR packages are private by default**: Pods get `ImagePullBackOff` with 403. Fix: create `ghcr-credentials` imagePullSecret in each namespace AND link the package to the repo in GHCR settings.
+2. **GHCR packages are private by default** (now public): The package is now public, so imagePullSecrets are no longer needed. If it were ever made private again, pods would get `ImagePullBackOff` with 403 — fix by creating `ghcr-credentials` imagePullSecret in each namespace AND linking the package to the repo in GHCR settings.
 
 3. **GHCR Actions permissions**: The CI/CD workflow's `${{ secrets.GITHUB_TOKEN }}` gets 403 unless you add the repo to the package's "Manage Actions access" with Write role.
 
@@ -741,19 +781,16 @@ Add more nodes in OVH console (Node pools tab → increase count).
 
 ### Deploy a new app version to staging
 
-Push to `main` → GitHub Actions builds and pushes `staging-latest` → `kubectl rollout restart deployment notafilia-web notafilia-celery notafilia-beat -n staging`
+Push to `main` → CI builds and pushes image → dispatches to infra repo → staging overlay auto-updated → ArgoCD syncs within 30 seconds. No manual step needed.
 
 ### Promote staging to production
 
-```bash
-docker pull ghcr.io/rafafuentes4/notafilia:<sha-from-staging>
-docker tag ghcr.io/rafafuentes4/notafilia:<sha> ghcr.io/rafafuentes4/notafilia:v1.1.0
-docker push ghcr.io/rafafuentes4/notafilia:v1.1.0
+Push a version tag — CI handles everything:
 
-# Update production kustomization
-cd notafilia-infra/overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:v1.1.0
-git commit -am "Promote v1.1.0 to production" && git push
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+# CI builds → dispatches to infra repo → staging + production auto-update
 ```
 
 ### Access ArgoCD UI
