@@ -5,7 +5,11 @@ set -euo pipefail
 # Destroys a preview environment
 
 BRANCH="${1:?Usage: $0 <branch-name>}"
-NAMESPACE="preview-${BRANCH}"
+NAMESPACE="${BRANCH}"
+
+# Ensure correct kubectl context
+export KUBECONFIG="$HOME/.kube/kubeconfig-production.yml:$HOME/.kube/kubeconfig-staging.yml:$HOME/.kube/notafilia-ovh.yaml"
+kubectl config use-context kubernetes-admin@notafilia > /dev/null
 
 echo "=== Destroying preview environment ==="
 echo "Namespace: $NAMESPACE"

@@ -5,9 +5,15 @@ set -euo pipefail
 # Creates a preview environment for a feature branch
 
 BRANCH="${1:?Usage: $0 <branch-name>}"
-NAMESPACE="preview-${BRANCH}"
+NAMESPACE="${BRANCH}"
 DOMAIN="${BRANCH}.notafilia.es"
 IMAGE="ghcr.io/rafafuentes4/notafilia:${BRANCH}"
+INFRA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+APP_DIR="$(cd "$INFRA_DIR/../notafilia" && pwd)"
+
+# Ensure correct kubectl context
+export KUBECONFIG="$HOME/.kube/kubeconfig-production.yml:$HOME/.kube/kubeconfig-staging.yml:$HOME/.kube/notafilia-ovh.yaml"
+kubectl config use-context kubernetes-admin@notafilia > /dev/null
 
 echo "=== Creating preview environment ==="
 echo "Branch:    $BRANCH"
@@ -18,7 +24,7 @@ echo ""
 
 # 1. Build and push the image
 echo ">>> Building Docker image..."
-cd "$(dirname "$0")/../../notafilia"
+cd "$APP_DIR"
 docker buildx build --platform linux/amd64 \
   -f Dockerfile.web \
   -t "$IMAGE" \
@@ -37,24 +43,21 @@ kubectl get secret notafilia-secrets -n staging -o json \
 
 # 4. Deploy using kustomize with inline patches
 echo ">>> Deploying..."
-cd "$(dirname "$0")/.."
-
-cat <<EOF | kubectl apply -f -
-$(kubectl kustomize overlays/staging/ \
+cd "$INFRA_DIR"
+kubectl kustomize overlays/staging/ \
   | sed "s/namespace: staging/namespace: $NAMESPACE/g" \
   | sed "s/staging\.notafilia\.es/$DOMAIN/g" \
-  | sed "s/newTag: .*/newTag: $BRANCH/g" \
-  | sed "s|ghcr.io/rafafuentes4/notafilia:[^ ]*|$IMAGE|g")
-EOF
+  | sed "s|ghcr.io/rafafuentes4/notafilia:[^ \"]*|$IMAGE|g" \
+  | kubectl apply -f -
 
 # 5. Wait for pods
 echo ""
 echo ">>> Waiting for pods..."
-kubectl rollout status deployment notafilia-web -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+kubectl rollout status deployment notafilia-web -n "$NAMESPACE" --timeout=180s 2>/dev/null || true
 
 # 6. Update Django Site
 echo ">>> Updating Django Site..."
-sleep 10
+sleep 5
 kubectl exec -n "$NAMESPACE" deployment/notafilia-web -c web -- \
   python manage.py shell -c "
 from django.contrib.sites.models import Site
