@@ -343,41 +343,29 @@ sops overlays/staging/secrets.enc.yaml
 
 ## 6. Deploying New Versions
 
-### How CI/CD works (fully automated)
+### How CI/CD works
 
-There are two deployment flows depending on whether you're deploying to staging or production:
-
-**Staging (fully automatic — zero manual steps after push):**
+CI only builds images on version tags (`v*`). Pushing to `main` does **not** trigger a build. Deployment is manual: you update the image tag in the infra repo overlay and push. ArgoCD picks up the change within 30 seconds.
 
 ```
-Push to main
-  → GitHub Actions builds image (tags: sha-xxx + staging-latest)
-    → CI dispatches to notafilia-infra repo
-      → Infra CI updates staging overlay tag → commits → pushes
-        → ArgoCD detects change → deploys new pods
-```
-
-**Production (one manual step — create a version tag):**
-
-```
-Create tag v0.2.0 → push tag
-  → GitHub Actions builds image (tags: 0.2.0 + 0.2 + sha-xxx)
-    → CI dispatches to notafilia-infra repo
-      → Infra CI updates BOTH staging + production tags → commits → pushes
-        → ArgoCD detects change → deploys new pods in both envs
+1. Develop on feature branch, merge to main
+2. Create version tag: git tag v0.3.0 && git push origin v0.3.0
+3. CI builds image (1-3 min) — produces tags: 0.3.0, 0.3, sha-xxx
+4. Deploy to staging: update overlays/staging/kustomization.yaml tag, commit, push
+5. ArgoCD syncs within ~30 seconds
+6. Test staging
+7. Deploy to production: update overlays/production/kustomization.yaml tag, commit, push
 ```
 
 ### Pipeline components
 
-| Repo | Workflow | Triggers on | What it does |
-|------|----------|-------------|-------------|
-| `notafilia` | `build-and-push.yml` | Push to `main`, tags `v*` | Builds Docker image, pushes to GHCR, dispatches to infra repo |
-| `notafilia-infra` | `update-image.yml` | `repository_dispatch` from app CI | Updates image tag in kustomization overlays, commits, pushes |
-| `notafilia-infra` | ArgoCD (in-cluster) | Git poll every ~3 min | Detects tag change, rolls out new pods |
+| Repo | Component | Triggers on | What it does |
+|------|-----------|-------------|-------------|
+| `notafilia` | `build-and-push.yml` | Tags `v*` only | Builds Docker image, pushes to GHCR with semver tags |
+| `notafilia-infra` | Manual Git commit | Developer pushes tag update | Updates image tag in kustomization overlay |
+| `notafilia-infra` | ArgoCD (in-cluster) | Git poll every ~30 sec | Detects tag change, rolls out new pods |
 
-### Workflow A: Deploy to staging (automatic)
-
-You just push code. Everything else is automated.
+### Workflow A: Build a new version
 
 ```bash
 cd ~/Developer/notafilia
@@ -391,77 +379,66 @@ make ruff                    # Python linting + formatting
 make npm-type-check          # TypeScript checks
 make test ARGS='--keepdb'    # Django tests
 
-# 3. Commit
+# 3. Commit and merge to main
 git add . && git commit -m "feat: description of change"
-
-# 4. Merge to main and push
 git checkout main
 git merge feature/my-change
 git push
 
-# 5. Done! Everything happens automatically:
-#    - GitHub Actions builds image (~1-3 min)
-#    - Infra repo gets auto-updated (~30 sec after build)
-#    - ArgoCD deploys new pods (~1-3 min after infra update)
-#    Total: ~3-5 minutes from push to live
+# 4. Create a version tag — this triggers CI
+git tag v0.3.0
+git push origin v0.3.0
 
-# 6. (Optional) Watch the pipeline
-gh run list --repo RafaFuentes4/notafilia --limit 1     # App CI
-gh run list --repo RafaFuentes4/notafilia-infra --limit 1  # Infra CI
-
-# 7. (Optional) Verify
-curl -s https://staging.notafilia.es/up
+# 5. (Optional) Watch CI build
+gh run list --repo RafaFuentes4/notafilia --limit 1
 ```
 
-### Workflow B: Deploy to staging AND production (version tag)
+### Workflow B: Deploy to staging
 
-When you're ready to release, create a version tag. This deploys to both environments.
-
-```bash
-cd ~/Developer/notafilia
-
-# 1. Make sure main is up to date and staging works
-git checkout main && git pull
-curl -s https://staging.notafilia.es/up   # Should return OK
-
-# 2. Create a version tag
-git tag v0.2.0
-git push origin v0.2.0
-
-# 3. Done! The pipeline:
-#    - Builds image with tag 0.2.0
-#    - Updates BOTH staging and production overlays in infra repo
-#    - ArgoCD deploys to both environments
-
-# 4. (Optional) Watch
-gh run list --repo RafaFuentes4/notafilia --limit 2
-gh run list --repo RafaFuentes4/notafilia-infra --limit 1
-
-# 5. Verify both environments
-curl -s https://staging.notafilia.es/up
-curl -s https://notafilia.es/up
-
-# 6. Check what's running
-use-notafilia
-kubectl get pods -n staging -l app.kubernetes.io/component=web \
-  -o jsonpath='{.items[0].spec.containers[0].image}'
-# Should show: ghcr.io/rafafuentes4/notafilia:0.2.0
-```
-
-### Workflow C: Deploy only to production (promote existing image)
-
-If staging already has the right version and you just want to promote it to production:
+After CI finishes building the image:
 
 ```bash
 cd ~/Developer/notafilia-infra
 
-# Update only the production overlay
-cd overlays/production
-kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.2.0
+# 1. Update the staging overlay tag
+cd overlays/staging
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
 cd ../..
-git add overlays/production && git commit -m "chore: promote 0.2.0 to production" && git push
 
-# ArgoCD deploys within ~3 minutes
+# 2. Commit and push
+git add overlays/staging && git commit -m "chore: deploy 0.3.0 to staging" && git push
+
+# 3. ArgoCD picks up the change within ~30 seconds
+
+# 4. Verify
+curl -s https://staging.notafilia.es/up
+
+# 5. Check what's running
+use-notafilia
+kubectl get pods -n staging -l app.kubernetes.io/component=web \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+# Should show: ghcr.io/rafafuentes4/notafilia:0.3.0
+```
+
+### Workflow C: Deploy to production
+
+After testing staging:
+
+```bash
+cd ~/Developer/notafilia-infra
+
+# 1. Update the production overlay tag
+cd overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+
+# 2. Commit and push
+git add overlays/production && git commit -m "chore: deploy 0.3.0 to production" && git push
+
+# 3. ArgoCD deploys within ~30 seconds
+
+# 4. Verify
+curl -s https://notafilia.es/up
 ```
 
 ### Deploy manually (without CI, for debugging)
@@ -493,7 +470,7 @@ kubectl rollout undo deployment notafilia-celery -n production
 kubectl rollout undo deployment notafilia-beat -n production
 ```
 
-> **Note**: ArgoCD will revert this within 3 minutes (self-heal). Use this for immediate relief while you fix the Git state.
+> **Note**: ArgoCD will revert this within ~30 seconds (self-heal). Use this for immediate relief while you fix the Git state.
 
 #### Permanent rollback (via Git)
 
@@ -523,9 +500,6 @@ kubectl rollout history deployment notafilia-web -n staging
 
 # Check GitHub Actions build status
 gh run list --repo RafaFuentes4/notafilia --limit 5
-
-# Check infra auto-update status
-gh run list --repo RafaFuentes4/notafilia-infra --limit 5
 ```
 
 ### Version numbering convention
@@ -547,17 +521,10 @@ git tag --list 'v*' --sort=-v:refname
 
 These are already configured. Documenting here so you know what exists:
 
-**Secrets needed:**
-
-| Secret | Repo | Purpose |
-|--------|------|---------|
-| `INFRA_REPO_PAT` | `notafilia` | Fine-grained PAT with Contents: Read/Write on `notafilia-infra`. Used to trigger `repository_dispatch`. |
-| `DEPLOY_PAT` | `notafilia-infra` | Same PAT. Used to `git push` the tag update commit. |
-
 **GHCR package:** Set to **Public** visibility so pods can pull without `imagePullSecrets`.
 Package settings: https://github.com/users/RafaFuentes4/packages/container/notafilia/settings
 
-**PAT renewal:** The fine-grained PAT may have an expiration. When it expires, CI will fail at the "Update staging in infra repo" step. Regenerate it and update both secrets.
+No special secrets (PATs) are needed. CI uses the automatic `GITHUB_TOKEN` for GHCR pushes. Deployment is done by manually updating the image tag in the infra repo and pushing.
 
 ---
 
@@ -707,7 +674,7 @@ cd ~/Developer/notafilia
 git checkout main
 git merge my-cool-feature
 git push
-# CI auto-deploys to staging
+# Then tag and deploy following the normal workflow (see Section 6)
 ```
 
 ### How it works under the hood

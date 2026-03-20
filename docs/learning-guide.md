@@ -15,12 +15,14 @@ Kubernetes automates all of this: you describe *what you want* (3 copies of my a
 ### What we built
 
 ```
-You push code → GitHub Actions builds a Docker image → pushes to GHCR
-                                                           ↓
+You tag a release → GitHub Actions builds a Docker image → pushes to GHCR
+                                                               ↓
+You update the image tag in the infra repo overlay → push to Git
+                                                               ↓
 ArgoCD watches the Git repo → detects changes → syncs to the cluster
-                                                           ↓
+                                                               ↓
 OVH Kubernetes runs: Traefik (routing) → Django (web) + Celery + PostgreSQL + Redis
-                                                           ↓
+                                                               ↓
 Users access: https://notafilia.es (production) / https://staging.notafilia.es (staging)
 ```
 
@@ -239,7 +241,7 @@ The base uses `ghcr.io/rafafuentes4/notafilia:latest`. The overlay changes the t
 ```yaml
 images:
   - name: ghcr.io/rafafuentes4/notafilia
-    newTag: "0.2.0"    # CI auto-updates this via repository_dispatch
+    newTag: "0.3.0"    # Manually updated when deploying a new version
 ```
 
 Kustomize finds every reference to that image and replaces the tag. No editing deployment files.
@@ -457,24 +459,18 @@ creation_rules:
 
 ## How CI/CD Works
 
-### The pipeline (fully automated)
+### The pipeline
 
-The pipeline is fully automated — no manual steps needed for either environment:
+CI only builds images on version tags (`v*`). Pushing to `main` does **not** trigger a build. Deployment is a manual step: you update the image tag in the infra repo overlay and push.
 
 ```
-Developer pushes to main
+Developer creates a version tag (v0.3.0)
   → GitHub Actions triggers
     → Builds Docker image (linux/amd64) from Dockerfile.web
-      → Pushes to GHCR with tags: {sha} + staging-latest
-        → Dispatches repository_dispatch to notafilia-infra
-          → Infra repo workflow updates staging overlay image tag
-            → ArgoCD detects change within 30 seconds → staging updated
+      → Pushes to GHCR with semver tags: 0.3.0, 0.3, sha-xxx
 
-Developer pushes a version tag (v*)
-  → Same build + push steps
-    → Dispatches repository_dispatch to notafilia-infra
-      → Infra repo workflow updates BOTH staging + production overlay image tags
-        → ArgoCD detects change within 30 seconds → both environments updated
+Developer updates infra repo overlay tag, commits, pushes
+  → ArgoCD detects change within 30 seconds → deploys new pods
 ```
 
 **Workflow file** (`.github/workflows/build-and-push.yml`):
@@ -482,18 +478,28 @@ Developer pushes a version tag (v*)
 - `platforms: linux/amd64` — critical because OVH nodes are x86 but dev machines are ARM
 - `cache-from: type=gha` — caches Docker layers in GitHub's cache (fast rebuilds)
 - `${{ secrets.GITHUB_TOKEN }}` — automatic OIDC token, no stored secrets needed
-- `repository_dispatch` — triggers a workflow in the infra repo to update image tags
 
-### Production promotion
-
-Production promotion is automated via version tags:
+### Deployment workflow
 
 ```bash
-# Just push a version tag — CI handles everything
-git tag v1.1.0
-git push origin v1.1.0
-# CI builds → dispatches to infra repo → staging + production auto-update
-# ArgoCD syncs within 30 seconds
+# 1. Create a version tag in the app repo
+cd ~/Developer/notafilia
+git tag v0.3.0 && git push origin v0.3.0
+# CI builds image (1-3 min)
+
+# 2. Deploy to staging
+cd ~/Developer/notafilia-infra/overlays/staging
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+git add overlays/staging && git commit -m "chore: deploy 0.3.0 to staging" && git push
+# ArgoCD syncs within ~30 seconds
+
+# 3. Test staging, then deploy to production
+cd overlays/production
+kustomize edit set image ghcr.io/rafafuentes4/notafilia:0.3.0
+cd ../..
+git add overlays/production && git commit -m "chore: deploy 0.3.0 to production" && git push
+# ArgoCD syncs within ~30 seconds
 ```
 
 ---
