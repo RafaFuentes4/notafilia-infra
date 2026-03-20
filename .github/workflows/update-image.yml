@@ -10,6 +10,8 @@ jobs:
     steps:
       - name: Checkout infra repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DEPLOY_PAT }}
 
       - name: Install kustomize
         uses: imranismail/setup-kustomize@v2
