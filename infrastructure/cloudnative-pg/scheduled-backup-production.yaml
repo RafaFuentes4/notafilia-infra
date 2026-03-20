@@ -1,0 +1,12 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: notafilia-pg-daily
+  namespace: production
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  schedule: "0 0 2 * * *"
+  backupOwnerReference: cluster
+  cluster:
+    name: notafilia-pg
