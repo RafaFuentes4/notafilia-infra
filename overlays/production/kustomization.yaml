@@ -36,4 +36,4 @@ patches:
 
 images:
 - name: ghcr.io/rafafuentes4/notafilia
-  newTag: 0.4.1
+  newTag: 0.4.2
