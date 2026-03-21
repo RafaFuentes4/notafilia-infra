@@ -8,7 +8,11 @@ cd ~/Developer/notafilia
 git tag v0.4.0 && git push origin v0.4.0
 
 # 2. Wait for build
-gh run list --repo RafaFuentes4/notafilia --limit 1 --watch
+gh run list --repo RafaFuentes4/notafilia --limit 1
+
+#Or as a one-liner that grabs the latest run and watches it:
+
+gh run watch --repo RafaFuentes4/notafilia $(gh run list --repo RafaFuentes4/notafilia --limit 1 --json databaseId -q '.[0].databaseId')
 ```
 
 ## Deploy to staging
