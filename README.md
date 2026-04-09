@@ -1,53 +1,79 @@
+<div align="center">
+
 # notafilia-infra
 
-Kubernetes infrastructure for [Notafilia](https://github.com/RafaFuentes4/notafilia), a Django application running in production on OVH Managed Kubernetes. Built around GitOps principles — the cluster state is fully declarative and driven by this repository.
+**Production Kubernetes infrastructure for [Notafilia](https://github.com/RafaFuentes4/notafilia) — a Django application deployed to OVH Managed Kubernetes using a full GitOps stack.**
 
-**Production** → [notafilia.es](https://notafilia.es) &nbsp;|&nbsp; **Staging** → [staging.notafilia.es](https://staging.notafilia.es)
+*The cluster state is fully declarative and driven by this repository. No manual `kubectl apply`, no configuration drift.*
 
----
+[![Production](https://img.shields.io/website?url=https%3A%2F%2Fnotafilia.es&label=production&style=for-the-badge&logo=kubernetes&logoColor=white&color=326CE5)](https://notafilia.es)
+[![Staging](https://img.shields.io/website?url=https%3A%2F%2Fstaging.notafilia.es&label=staging&style=for-the-badge&logo=kubernetes&logoColor=white&color=6B7280)](https://staging.notafilia.es)
 
-## What this repo does
-
-This repository is the single source of truth for the entire infrastructure. ArgoCD watches it and reconciles the cluster automatically — no manual `kubectl apply`, no configuration drift.
-
-Everything is here: app deployments, ingress routing, TLS certificates, PostgreSQL clusters, Redis, secrets, and automated backups.
+</div>
 
 ---
 
 ## Stack
 
+<div align="center">
+
+![ArgoCD](https://img.shields.io/badge/ArgoCD-EF7B4D?style=flat-square&logo=argo&logoColor=white)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=flat-square&logo=kubernetes&logoColor=white)
+![Kustomize](https://img.shields.io/badge/Kustomize-326CE5?style=flat-square&logo=kubernetes&logoColor=white)
+![Traefik](https://img.shields.io/badge/Traefik-24A1C1?style=flat-square&logo=traefikproxy&logoColor=white)
+![cert-manager](https://img.shields.io/badge/cert--manager-003A9B?style=flat-square&logo=letsencrypt&logoColor=white)
+![SOPS](https://img.shields.io/badge/SOPS-000000?style=flat-square&logo=gnuprivacyguard&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/CloudNativePG-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-DC382D?style=flat-square&logo=redis&logoColor=white)
+![Django](https://img.shields.io/badge/Django-092E20?style=flat-square&logo=django&logoColor=white)
+![Celery](https://img.shields.io/badge/Celery-37814A?style=flat-square&logo=celery&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white)
+![OVH](https://img.shields.io/badge/OVH_Cloud-123F6D?style=flat-square&logo=ovh&logoColor=white)
+
+</div>
+
 | Concern | Tool | Why |
 |---------|------|-----|
 | GitOps controller | **ArgoCD** | App-of-apps pattern, self-healing, drift detection |
 | App manifests | **Kustomize** | Plain YAML with environment overlays — no templating engine needed |
-| Ingress | **Traefik v3 + Gateway API** | Modern routing standard, replaces Ingress resource |
+| Ingress | **Traefik v3 + Gateway API** | Modern routing standard, replaces legacy Ingress resource |
 | TLS | **cert-manager + Let's Encrypt** | Fully automated certificate lifecycle |
-| Secrets | **SOPS + age** | Encrypted at value-level in Git — safe to commit, no secrets controller needed |
-| PostgreSQL | **CloudNativePG operator** | Production-grade PG on K8s with streaming replication support |
-| Async tasks | **Celery + Redis** | Worker and beat scheduler as separate deployments |
+| Secrets | **SOPS + age** | Value-level encryption in Git — safe to commit, no in-cluster controller needed |
+| PostgreSQL | **CloudNativePG operator** | Production-grade PG on K8s with declarative lifecycle management |
+| Async tasks | **Celery + Redis** | Worker and beat scheduler as separate Deployments |
 | Media storage | **OVH Object Storage (S3-compatible)** | Offloaded from pods via django-storages |
-| DB backups | **Barman → OVH S3** | Daily scheduled backups with 2-day retention |
+| DB backups | **Barman → OVH S3** | Daily scheduled backups with retention policy |
 | CI/CD | **GitHub Actions → GHCR** | Image built and pushed on merge to main |
-| Cluster | **OVH Managed Kubernetes** (GRA9, B3-8 node) | Managed control plane, OVH Cinder persistent volumes |
+| Cluster | **OVH Managed Kubernetes** (GRA9, B3-8) | Managed control plane, Cinder persistent volumes |
 
 ---
 
 ## Architecture
 
-```
-Internet
-  └─▶ DNS (notafilia.es / staging.notafilia.es)
-        └─▶ OVH LoadBalancer (public IP)
-              └─▶ Traefik (TLS termination, Let's Encrypt cert)
-                    └─▶ Gateway API HTTPRoute (host-based routing)
-                          └─▶ notafilia-web Service
-                                └─▶ Gunicorn pod
-                                      ├─▶ CloudNativePG (PostgreSQL)
-                                      ├─▶ Redis (session/cache/broker)
-                                      └─▶ OVH Object Storage (media files)
+```mermaid
+graph TD
+    Internet([Internet]) --> DNS[DNS\nnotafilia.es / staging.notafilia.es]
+    DNS --> LB[OVH LoadBalancer]
+    LB --> Traefik[Traefik v3\nTLS termination]
+    Traefik --> HTTPRoute[Gateway API HTTPRoute\nhost-based routing]
+    HTTPRoute --> Web[notafilia-web\nGunicorn]
 
-GitOps loop:
-  Git push → ArgoCD detects diff → reconciles cluster state
+    Web --> PG[(CloudNativePG\nPostgreSQL)]
+    Web --> Redis[(Redis 7)]
+    Web --> S3[OVH Object Storage\nMedia files]
+
+    PG --> Backup[Barman Backups\nOVH S3]
+
+    subgraph GitOps
+        GitHub[(GitHub\nnotafilia-infra)] --> ArgoCD[ArgoCD]
+        ArgoCD -->|reconciles| HTTPRoute
+        ArgoCD -->|reconciles| Web
+        ArgoCD -->|reconciles| PG
+        ArgoCD -->|reconciles| Redis
+        ArgoCD -->|reconciles| Traefik
+    end
+
+    style GitOps fill:#f0f4ff,stroke:#326CE5
 ```
 
 ---
@@ -72,13 +98,13 @@ notafilia-infra/
 │       ├── kustomization.yaml
 │       └── secrets.enc.yaml
 │
-├── infrastructure/                # Third-party services managed as ArgoCD Applications
+├── infrastructure/                # Third-party services as ArgoCD Applications
 │   ├── traefik/                   # Traefik v3 via Helm + Gateway API CRDs
 │   ├── cert-manager/              # cert-manager + ClusterIssuer + Certificate
 │   ├── cloudnative-pg/            # CNPG operator + per-environment PG Cluster CRs
-│   └── redis/                     # redis:7-alpine StatefulSet per environment
+│   └── redis/                     # redis:7-alpine per environment
 │
-├── argocd/                        # ArgoCD bootstrap (apply once, then GitOps takes over)
+├── argocd/                        # Bootstrap (apply once, then GitOps takes over)
 │   ├── app-of-apps.yaml           # Root Application — manages all other Applications
 │   ├── infrastructure.yaml        # Points ArgoCD at the infrastructure/ directory
 │   ├── staging.yaml               # Deploys app to staging namespace
@@ -87,38 +113,26 @@ notafilia-infra/
 ├── .sops.yaml                     # SOPS encryption rules (age public key per env)
 └── docs/
     ├── progress.md                # Full setup journal — recreate from scratch
-    ├── learning-guide.md          # K8s concepts explained with examples from this project
-    ├── operations-guide.md        # Day-2 operations: deployments, backups, debugging
-    └── preview-environments-pattern.md  # Pattern for ephemeral preview environments
+    ├── learning-guide.md          # K8s concepts explained with real examples
+    ├── operations-guide.md        # Day-2 ops: deployments, backups, debugging
+    └── preview-environments-pattern.md
 ```
 
 ---
 
 ## Key Design Decisions
 
-**App-of-apps pattern** — A single root ArgoCD Application manages all other Applications. Bootstrap the entire cluster with one `kubectl apply`.
+**App-of-apps pattern** — A single root ArgoCD Application manages all other Applications. Bootstrap the entire cluster with one `kubectl apply -f argocd/app-of-apps.yaml`.
 
-**Kustomize over Helm for app manifests** — The app is simple enough that plain YAML with overlays is more readable and auditable than a Helm chart. Helm is reserved for third-party infra (Traefik, cert-manager) where charts are maintained upstream.
+**Kustomize over Helm for app manifests** — The app is simple enough that plain YAML with overlays is more readable and auditable than a Helm chart. Helm is reserved for third-party infra where charts are actively maintained upstream.
 
-**SOPS + age over Sealed Secrets** — Secrets are encrypted at value level in Git. No in-cluster controller required for decryption, no dependency on a running CRD to read your own secrets. The age private key lives only in the cluster (as a K8s Secret) and in a secure backup.
+**SOPS + age over Sealed Secrets** — Secrets are encrypted at value level in Git. No in-cluster controller required for decryption, no dependency on a running CRD to read your own secrets.
 
-**CloudNativePG over plain StatefulSet** — The CNPG operator handles PG lifecycle (initdb, credentials, streaming replication, connection pooling) declaratively. Backup to S3-compatible storage is configured in the Cluster CR.
+**CloudNativePG over plain StatefulSet** — The CNPG operator handles PG lifecycle declaratively: initdb, credentials, streaming replication, connection pooling. S3 backup is configured directly in the Cluster CR.
 
-**Gateway API over Ingress** — Traefik v3 supports the Gateway API standard (replacing the legacy Ingress resource). HTTPRoute resources are more expressive and the API is now stable in Kubernetes.
+**Gateway API over Ingress** — Traefik v3 implements the Gateway API standard (replacing the legacy Ingress resource). HTTPRoutes are more expressive and the API is now stable in Kubernetes.
 
 **Separate deployments per component** — web, celery worker, and celery beat are three separate Deployments from the same image. Beat uses `Recreate` strategy to prevent duplicate scheduler instances.
-
----
-
-## App Components
-
-Three deployments, one image (`ghcr.io/rafafuentes4/notafilia`):
-
-| Deployment | Command | Notes |
-|------------|---------|-------|
-| `notafilia-web` | `gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 8` | Django migrate runs as init container |
-| `notafilia-celery` | `celery -A notafilia worker --pool threads --concurrency 20` | Async task processing |
-| `notafilia-beat` | `celery -A notafilia beat -l INFO` | Periodic task scheduler, Recreate strategy |
 
 ---
 
@@ -129,36 +143,23 @@ Three deployments, one image (`ghcr.io/rafafuentes4/notafilia`):
 | URL | [staging.notafilia.es](https://staging.notafilia.es) | [notafilia.es](https://notafilia.es) |
 | Namespace | `staging` | `production` |
 | PostgreSQL | 1 instance, 10Gi | 1 instance, 20Gi |
-| Replicas (web) | 1 | 1 |
-| ArgoCD sync | Auto (prune + self-heal) | Self-heal only (no auto-prune) |
+| ArgoCD sync | Auto (prune + self-heal) | Self-heal only (manual prune) |
 
 ---
 
 ## Secrets Management
 
-Secrets are encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) and committed to Git. Each `secrets.enc.yaml` is a standard Kubernetes Secret manifest encrypted at value level — the keys are visible, only the values are ciphertext.
+Secrets are encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) and committed to Git. Each `secrets.enc.yaml` is a standard Kubernetes Secret manifest with values encrypted at the field level — keys are visible, values are ciphertext.
 
 ```bash
-# Decrypt and edit a secret
+# Decrypt and edit interactively
 sops overlays/staging/secrets.enc.yaml
 
 # Re-encrypt after editing
 sops -e -i overlays/staging/secrets.enc.yaml
 ```
 
-The age private key is stored as a K8s Secret in the cluster and mounted into the ArgoCD repo-server for decryption at sync time.
-
----
-
-## Automated Backups
-
-PostgreSQL production backups run daily via CloudNativePG's Barman integration, writing to OVH Object Storage (S3-compatible):
-
-```
-s3://notafilia-media/pg-backups/production
-```
-
-Retention: 2 days. Restore procedure documented in [ops guide](docs/operations-guide.md).
+The age private key is mounted into the ArgoCD repo-server as a K8s Secret, enabling decryption at sync time.
 
 ---
 
@@ -175,7 +176,7 @@ kubectl apply -f argocd/app-of-apps.yaml
 # Watch all ArgoCD apps
 kubectl get applications -n argocd -w
 
-# Tail app logs
+# Tail production logs
 kubectl logs -n production -l app.kubernetes.io/component=web -c web --tail=50 -f
 
 # Run a Django management command
@@ -184,27 +185,7 @@ kubectl exec -n production deployment/notafilia-web -c web -- python manage.py s
 # Connect to PostgreSQL directly
 kubectl port-forward -n production svc/notafilia-pg-rw 5434:5432
 psql -h 127.0.0.1 -p 5434 -U notafilia -d notafilia
-
-# Decrypt and inspect secrets
-sops -d overlays/staging/secrets.enc.yaml
 ```
-
----
-
-## Deploy a New Version
-
-Image tags are pinned in `overlays/*/kustomization.yaml`. To deploy:
-
-```bash
-# Update the image tag in both overlays
-NEW_TAG=0.6.0
-sed -i '' "s/newTag: .*/newTag: $NEW_TAG/" overlays/staging/kustomization.yaml
-git commit -am "chore: update image tag to $NEW_TAG in staging"
-git push
-# ArgoCD picks up the change and rolls out automatically
-```
-
-Full deployment guide in [docs/operations-guide.md](docs/operations-guide.md).
 
 ---
 
